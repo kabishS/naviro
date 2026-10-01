@@ -10,7 +10,7 @@
 
 **NAVIRO** is an intelligent rover path planning and simulated terrain navigation system. It combines an **AI Neural Risk Prediction Engine** with a **Risk-Weighted A* Pathfinding Algorithm** to find safe and optimal routes across hazardous terrains.
 
-**Live link: ** https://naviro-b0kt.onrender.com/
+Live link:   https://naviro-b0kt.onrender.com/
 
 ---
 

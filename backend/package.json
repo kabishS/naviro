@@ -1,0 +1,29 @@
+{
+  "name": "rover-navigation-backend",
+  "version": "1.0.0",
+  "description": "Node.js & Express communication layer for Rover Path Planning with WebSocket and PX4/ROS 2 bridge support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test/api.test.js"
+  },
+  "keywords": [
+    "rover",
+    "path-planning",
+    "threejs",
+    "px4",
+    "ros2",
+    "sitl",
+    "websockets",
+    "express"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
+}

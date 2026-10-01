@@ -1,0 +1,19 @@
+# PX4 SITL & Geographic Coordinate Conversion Configuration
+# Maps discrete 3D simulation terrain coordinates to PX4 Local NED and WGS-84 GPS
+
+origin:
+  latitude_deg: 47.397742       # Default PX4 Gazebo Zurich home latitude
+  longitude_deg: 8.545594       # Default PX4 Gazebo Zurich home longitude
+  altitude_m: 488.0             # Default ground level AMSL
+
+vehicle:
+  type: "rover"                 # Rover / Ground Vehicle profile
+  cruise_speed_m_s: 2.0         # Default mission speed
+  acceptance_radius_m: 1.0      # Waypoint arrival tolerance radius
+  turn_mode: "pivot"            # Skid-steer / differential rover turning
+
+connection:
+  bridge_host: "0.0.0.0"
+  bridge_port: 5000
+  px4_sitl_udp: "udp:127.0.0.1:14540"
+  ros2_topic: "/fmu/in/trajectory_setpoint"

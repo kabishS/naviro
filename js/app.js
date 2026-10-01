@@ -1,0 +1,3234 @@
+window.addEventListener('error', function(e) {
+        var overlay = document.getElementById('diagnostics-overlay');
+        if (overlay) {
+            overlay.style.display = 'block';
+            overlay.innerHTML = '<strong>Simulation Error:</strong> ' + (e.message || e);
+        }
+    });
+
+    (function () {
+        'use strict';
+
+        /* 1. CONSTANTS & CONFIGURATION */
+        const GRID_CONFIG = {
+            COLS: 28,
+            ROWS: 28,
+            CELL_SIZE: 2.0,
+            DEFAULT_ELEVATION: 0,
+            MAX_ELEVATION: 3.5,
+            MIN_ELEVATION: -1.8,
+            SLOPE_COST_WEIGHT: 3.0
+        };
+
+        const CELL_TYPES = {
+            EMPTY: 'empty',
+            ROCK: 'rock',
+            BLOCK: 'block',
+            WALL: 'wall',
+            CRATER: 'crater',
+            HILL: 'hill',
+            RESTRICTED_BLOCKED: 'restricted_blocked',
+            RESTRICTED_HIGH_COST: 'restricted_high_cost',
+            START: 'start',
+            DESTINATION: 'destination'
+        };
+
+        const MOVEMENT_COSTS = {
+            BASE: 1.0,
+            DIAGONAL: Math.SQRT2,
+            HIGH_COST_ZONE: 6.0,
+            ELEVATION_PENALTY_FACTOR: 2.5,
+            BLOCKED: Infinity
+        };
+
+        const SIMULATION_SPEEDS = {
+            SLOW: 0.35,   // ~0.7 m/s (deliberate planetary traversal, perfect for observing path & landscape)
+            NORMAL: 0.75, // ~1.5 m/s (smooth steady cruise along the path)
+            FAST: 1.8     // ~3.6 m/s (brisk travel)
+        };
+
+        const CAMERA_VIEWS = {
+            ISOMETRIC: { pos: [35, 40, 35], target: [0, 0, 0] },
+            TOP: { pos: [0, 58, 0.01], target: [0, 0, 0] },
+            FRONT: { pos: [0, 24, 46], target: [0, 0, 0] },
+            SIDE: { pos: [46, 24, 0], target: [0, 0, 0] }
+        };
+
+        const COLORS = {
+            GRID_BASE: 0x181e29,
+            GRID_LINE: 0x2e384d,
+            TERRAIN_LOW: 0x121721,
+            TERRAIN_MID: 0x222c3d,
+            TERRAIN_HIGH: 0x3d4e68,
+            START_MARKER: 0x10b981,
+            DESTINATION_MARKER: 0xef4444,
+            PATH_LINE: 0x06b6d4,
+            PATH_LINE_DIJKSTRA: 0xa855f7,
+            PATH_LINE_SHORTEST: 0xf59e0b,
+            PATH_LINE_BEST: 0x06b6d4,
+            PATH_CELL_HIGHLIGHT: 0x06b6d4,
+            EXPLORED_NODE: 0x1e3a5f,
+            ROVER_BODY: 0xf1f5f9,
+            ROVER_ACCENT: 0x0ea5e9,
+            ROVER_WHEEL: 0x0f172a,
+            OBSTACLE_ROCK: 0x64748b,
+            OBSTACLE_BLOCK: 0xf59e0b,
+            OBSTACLE_WALL: 0xdc2626,
+            OBSTACLE_CRATER: 0x475569,
+            RESTRICTED_BLOCKED: 0xef4444,
+            RESTRICTED_HIGH_COST: 0xeab308
+        };
+
+        /* 2. PRIORITY QUEUE (BINARY MIN-HEAP) */
+        class PriorityQueue {
+            constructor() { this.heap = []; }
+            push(item, priority) {
+                this.heap.push({ item, priority });
+                this._bubbleUp(this.heap.length - 1);
+            }
+            pop() {
+                if (this.isEmpty()) return null;
+                const min = this.heap[0];
+                const last = this.heap.pop();
+                if (this.heap.length > 0) {
+                    this.heap[0] = last;
+                    this._sinkDown(0);
+                }
+                return min.item;
+            }
+            isEmpty() { return this.heap.length === 0; }
+            size() { return this.heap.length; }
+            clear() { this.heap = []; }
+            _bubbleUp(index) {
+                while (index > 0) {
+                    const parent = Math.floor((index - 1) / 2);
+                    if (this.heap[index].priority >= this.heap[parent].priority) break;
+                    const temp = this.heap[index];
+                    this.heap[index] = this.heap[parent];
+                    this.heap[parent] = temp;
+                    index = parent;
+                }
+            }
+            _sinkDown(index) {
+                const len = this.heap.length;
+                while (true) {
+                    let left = 2 * index + 1;
+                    let right = 2 * index + 2;
+                    let smallest = index;
+                    if (left < len && this.heap[left].priority < this.heap[smallest].priority) smallest = left;
+                    if (right < len && this.heap[right].priority < this.heap[smallest].priority) smallest = right;
+                    if (smallest === index) break;
+                    const temp = this.heap[index];
+                    this.heap[index] = this.heap[smallest];
+                    this.heap[smallest] = temp;
+                    index = smallest;
+                }
+            }
+        }
+
+        /* 3. GRID MODEL */
+        class Grid {
+            constructor(cols = GRID_CONFIG.COLS, rows = GRID_CONFIG.ROWS, cellSize = GRID_CONFIG.CELL_SIZE) {
+                this.cols = cols;
+                this.rows = rows;
+                this.cellSize = cellSize;
+                this.mode = 'flat';
+                this.start = { col: 3, row: Math.floor(rows / 2) };
+                this.destination = { col: cols - 4, row: Math.floor(rows / 2) };
+                this.restrictedMode = 'high_cost';
+                this.fogOfWar = false;
+                this.discoveredCells = new Set();
+                this.slopeProfile = 'ridges';
+                this.slopeIntensity = 1.0;
+                this.cells = [];
+                this.initCells();
+                this.applyPreset('medium');
+            }
+
+            initCells() {
+                this.cells = [];
+                for (let r = 0; r < this.rows; r++) {
+                    const row = [];
+                    for (let c = 0; c < this.cols; c++) {
+                        row.push({
+                            col: c, row: r, type: CELL_TYPES.EMPTY,
+                            elevation: 0, costMultiplier: 1.0, isWalkable: true
+                        });
+                    }
+                    this.cells.push(row);
+                }
+            }
+
+            gridToWorld(col, row) {
+                const halfW = ((this.cols - 1) * this.cellSize) / 2;
+                const halfD = ((this.rows - 1) * this.cellSize) / 2;
+                return {
+                    x: col * this.cellSize - halfW,
+                    y: this.getCellElevation(col, row),
+                    z: row * this.cellSize - halfD
+                };
+            }
+
+            worldToGrid(x, z) {
+                const halfW = ((this.cols - 1) * this.cellSize) / 2;
+                const halfD = ((this.rows - 1) * this.cellSize) / 2;
+                const col = Math.round((x + halfW) / this.cellSize);
+                const row = Math.round((z + halfD) / this.cellSize);
+                return {
+                    col: Math.max(0, Math.min(this.cols - 1, col)),
+                    row: Math.max(0, Math.min(this.rows - 1, row))
+                };
+            }
+
+            getCell(col, row) {
+                if (col < 0 || col >= this.cols || row < 0 || row >= this.rows) return null;
+                return this.cells[row][col];
+            }
+
+
+            getExactElevation(x, z) {
+                if (this.mode === 'flat') return 0;
+                const halfW = ((this.cols - 1) * this.cellSize) / 2;
+                const halfD = ((this.rows - 1) * this.cellSize) / 2;
+                const colF = (x + halfW) / this.cellSize;
+                const rowF = (z + halfD) / this.cellSize;
+
+                const c0 = Math.max(0, Math.min(this.cols - 1, Math.floor(colF)));
+                const c1 = Math.max(0, Math.min(this.cols - 1, Math.ceil(colF)));
+                const r0 = Math.max(0, Math.min(this.rows - 1, Math.floor(rowF)));
+                const r1 = Math.max(0, Math.min(this.rows - 1, Math.ceil(rowF)));
+
+                const fx = colF - c0;
+                const fz = rowF - r0;
+
+                const h00 = this.getCellElevation(c0, r0);
+                const h10 = this.getCellElevation(c1, r0);
+                const h01 = this.getCellElevation(c0, r1);
+                const h11 = this.getCellElevation(c1, r1);
+
+                const hTop = h00 + (h10 - h00) * fx;
+                const hBot = h01 + (h11 - h01) * fx;
+                return hTop + (hBot - hTop) * fz;
+            }
+
+            getTerrainNormal(x, z) {
+                if (this.mode === 'flat') return { nx: 0, ny: 1, nz: 0, slopeX: 0, slopeZ: 0 };
+                const eps = 0.35;
+                const hL = this.getExactElevation(x - eps, z);
+                const hR = this.getExactElevation(x + eps, z);
+                const hD = this.getExactElevation(x, z - eps);
+                const hU = this.getExactElevation(x, z + eps);
+
+                const dhdx = (hR - hL) / (2 * eps);
+                const dhdz = (hU - hD) / (2 * eps);
+
+                const len = Math.hypot(dhdx, 1.0, dhdz);
+                return {
+                    nx: -dhdx / len,
+                    ny: 1.0 / len,
+                    nz: -dhdz / len,
+                    slopeX: dhdx,
+                    slopeZ: dhdz
+                };
+            }
+
+            getCellElevation(col, row) {
+                const cell = this.getCell(col, row);
+                if (!cell) return 0;
+                return this.mode === 'uneven' ? cell.elevation : 0;
+            }
+
+            setSlopeProfile(profile) {
+                this.slopeProfile = profile;
+                if (this.mode === 'uneven') {
+                    this.generateProceduralHeights();
+                }
+            }
+
+            setSlopeIntensity(intensity) {
+                this.slopeIntensity = intensity;
+                if (this.mode === 'uneven') {
+                    this.generateProceduralHeights();
+                }
+            }
+
+            setTerrainMode(mode) {
+                this.mode = mode;
+                if (mode === 'uneven') {
+                    this.generateProceduralHeights();
+                } else {
+                    for (let r = 0; r < this.rows; r++) {
+                        for (let c = 0; c < this.cols; c++) {
+                            this.cells[r][c].elevation = 0;
+                        }
+                    }
+                }
+            }
+
+            generateProceduralHeights() {
+                const profile = this.slopeProfile || 'ridges';
+                const intensity = (this.slopeIntensity !== undefined) ? this.slopeIntensity : 1.0;
+
+                for (let r = 0; r < this.rows; r++) {
+                    for (let c = 0; c < this.cols; c++) {
+                        const cell = this.cells[r][c];
+                        const nx = c / (this.cols - 1);
+                        const ny = r / (this.rows - 1);
+                        let h = 0;
+
+                        if (profile === 'ridges') {
+                            // Mountain Ridges: Central ridge barrier (steep slides) with a distinct low saddle pass
+                            const ridgeDist = Math.abs(nx - 0.50);
+                            const ridgeProfile = Math.exp(-Math.pow(ridgeDist * 6.0, 2)) * 3.4;
+                            const passDip = Math.exp(-Math.pow((ny - 0.78) * 9.0, 2)) * Math.exp(-Math.pow(ridgeDist * 5.0, 2)) * 3.2;
+                            const minorWaves = Math.sin(ny * Math.PI * 3.0) * 0.25;
+                            h = (ridgeProfile - passDip + minorWaves) * intensity;
+                        } else if (profile === 'dunes') {
+                            // Rolling Sand Dunes: Continuous harmonic sinusoidal slides
+                            const wave1 = Math.sin(nx * Math.PI * 3.6 + ny * Math.PI * 2.2) * 1.5;
+                            const wave2 = Math.cos(nx * Math.PI * 2.0 - ny * Math.PI * 3.2) * 0.8;
+                            const wave3 = Math.sin((nx + ny) * Math.PI * 4.5) * 0.35;
+                            h = (wave1 + wave2 + wave3) * intensity;
+                        } else if (profile === 'canyon') {
+                            // Canyon Pass: High cliffs/plateaus with a winding central canyon pass
+                            const canyonCenter = 0.5 + Math.sin(nx * Math.PI * 2.2) * 0.22;
+                            const distFromCanyon = Math.abs(ny - canyonCenter);
+                            const cliff = Math.min(3.2, Math.max(0.0, (distFromCanyon - 0.08) * 16.0));
+                            h = (cliff - 0.5) * intensity;
+                        } else if (profile === 'craters') {
+                            // Crater Basin: Impact craters with elevated lip slides and deep bowl depressions
+                            const d1 = Math.hypot(nx - 0.44, ny - 0.46);
+                            const c1 = (d1 < 0.16) ? (-1.6 + (d1 / 0.16) * 0.5) : (d1 < 0.24 ? Math.sin((d1 - 0.16) / 0.08 * Math.PI) * 1.7 : 0);
+                            const d2 = Math.hypot(nx - 0.72, ny - 0.28);
+                            const c2 = (d2 < 0.14) ? (-1.4 + (d2 / 0.14) * 0.4) : (d2 < 0.21 ? Math.sin((d2 - 0.14) / 0.07 * Math.PI) * 1.3 : 0);
+                            const d3 = Math.hypot(nx - 0.55, ny - 0.78);
+                            const c3 = (d3 < 0.13) ? (-1.3 + (d3 / 0.13) * 0.4) : (d3 < 0.19 ? Math.sin((d3 - 0.13) / 0.06 * Math.PI) * 1.1 : 0);
+                            const gentleBase = Math.sin(nx * Math.PI * 2.0) * Math.cos(ny * Math.PI * 2.0) * 0.3;
+                            h = (c1 + c2 + c3 + gentleBase) * intensity;
+                        } else {
+                            // Rugged Highlands ('steeps'): Complex multi-frequency landscape with sharp slides
+                            const w1 = Math.sin(nx * Math.PI * 4.2 + 0.4) * Math.cos(ny * Math.PI * 3.6 + 0.2);
+                            const w2 = Math.sin(nx * Math.PI * 8.0) * Math.cos(ny * Math.PI * 7.0) * 0.5;
+                            const w3 = Math.cos((nx + ny) * Math.PI * 5.5) * 0.4;
+                            h = (w1 + w2 + w3) * 1.8 * intensity;
+                        }
+
+                        // Smoothly taper to zero near Start and Destination
+                        const distStart = Math.hypot(c - this.start.col, r - this.start.row);
+                        const distDest = Math.hypot(c - this.destination.col, r - this.destination.row);
+                        if (distStart < 3.5) h *= Math.max(0, (distStart - 1.0) / 2.5);
+                        if (distDest < 3.5) h *= Math.max(0, (distDest - 1.0) / 2.5);
+
+                        if (cell.type === CELL_TYPES.HILL) h = Math.max(h, 2.2);
+                        if (cell.type === CELL_TYPES.CRATER) h = Math.min(h, -1.5);
+
+                        cell.elevation = Math.max(GRID_CONFIG.MIN_ELEVATION, Math.min(GRID_CONFIG.MAX_ELEVATION, h));
+                    }
+                }
+            }
+
+            isWalkable(col, row) {
+                const cell = this.getCell(col, row);
+                if (!cell) return false;
+                if (
+                    cell.type === CELL_TYPES.ROCK ||
+                    cell.type === CELL_TYPES.BLOCK ||
+                    cell.type === CELL_TYPES.WALL ||
+                    cell.type === CELL_TYPES.RESTRICTED_BLOCKED
+                ) return false;
+                return true;
+            }
+
+            getMovementCost(fromCol, fromRow, toCol, toRow) {
+                if (!this.isWalkable(toCol, toRow)) return MOVEMENT_COSTS.BLOCKED;
+                const dx = Math.abs(toCol - fromCol);
+                const dz = Math.abs(toRow - fromRow);
+                let cost = (dx > 0 && dz > 0) ? MOVEMENT_COSTS.DIAGONAL : MOVEMENT_COSTS.BASE;
+
+                const targetCell = this.getCell(toCol, toRow);
+                if (targetCell.type === CELL_TYPES.RESTRICTED_HIGH_COST) {
+                    cost *= MOVEMENT_COSTS.HIGH_COST_ZONE;
+                }
+
+                if (this.mode === 'uneven') {
+                    const fromElev = this.getCellElevation(fromCol, fromRow);
+                    const toElev = this.getCellElevation(toCol, toRow);
+                    const deltaH = Math.abs(toElev - fromElev);
+                    const inclineMultiplier = toElev > fromElev ? 1.4 : 0.8;
+                    cost += deltaH * MOVEMENT_COSTS.ELEVATION_PENALTY_FACTOR * inclineMultiplier;
+
+                    if (targetCell.type === CELL_TYPES.CRATER) cost += 3.0;
+                    if (targetCell.type === CELL_TYPES.HILL) cost += 2.5;
+                }
+                return cost;
+            }
+
+
+            revealAround(centerCol, centerRow, radius = 4.5) {
+                const newlyDiscovered = [];
+                const minCol = Math.max(0, Math.floor(centerCol - radius));
+                const maxCol = Math.min(this.cols - 1, Math.ceil(centerCol + radius));
+                const minRow = Math.max(0, Math.floor(centerRow - radius));
+                const maxRow = Math.min(this.rows - 1, Math.ceil(centerRow + radius));
+
+                for (let r = minRow; r <= maxRow; r++) {
+                    for (let c = minCol; c <= maxCol; c++) {
+                        if (Math.hypot(c - centerCol, r - centerRow) <= radius) {
+                            const key = c + ',' + r;
+                            if (!this.discoveredCells.has(key)) {
+                                this.discoveredCells.add(key);
+                                const cell = this.getCell(c, r);
+                                if (cell && cell.type !== CELL_TYPES.EMPTY) {
+                                    newlyDiscovered.push(cell);
+                                }
+                            }
+                        }
+                    }
+                }
+                return newlyDiscovered;
+            }
+
+            isCellDiscovered(col, row) {
+                if (!this.fogOfWar) return true;
+                return this.discoveredCells.has(col + ',' + row);
+            }
+
+            getNeighbors(col, row) {
+                const neighbors = [];
+                const directions = [
+                    { dc: 0, dr: -1 }, { dc: 1, dr: 0 }, { dc: 0, dr: 1 }, { dc: -1, dr: 0 },
+                    { dc: 1, dr: -1 }, { dc: 1, dr: 1 }, { dc: -1, dr: 1 }, { dc: -1, dr: -1 }
+                ];
+                for (const dir of directions) {
+                    const nc = col + dir.dc;
+                    const nr = row + dir.dr;
+                    if (this.isWalkable(nc, nr)) {
+                        if (Math.abs(dir.dc) === 1 && Math.abs(dir.dr) === 1) {
+                            if (!this.isWalkable(col + dir.dc, row) && !this.isWalkable(col, row + dir.dr)) continue;
+                        }
+                        neighbors.push({ col: nc, row: nr });
+                    }
+                }
+                return neighbors;
+            }
+
+            setCellType(col, row, type) {
+                const cell = this.getCell(col, row);
+                if (!cell) return false;
+                if ((col === this.start.col && row === this.start.row) ||
+                    (col === this.destination.col && row === this.destination.row)) return false;
+
+                cell.type = type;
+                cell.isWalkable = !(type === CELL_TYPES.ROCK || type === CELL_TYPES.BLOCK || type === CELL_TYPES.WALL || type === CELL_TYPES.RESTRICTED_BLOCKED);
+
+                if (this.mode === 'uneven') {
+                    if (type === CELL_TYPES.HILL) cell.elevation = Math.max(cell.elevation, 2.5);
+                    if (type === CELL_TYPES.CRATER) cell.elevation = Math.min(cell.elevation, -1.8);
+                }
+                return true;
+            }
+
+            clearCell(col, row) {
+                const cell = this.getCell(col, row);
+                if (!cell) return;
+                cell.type = CELL_TYPES.EMPTY;
+                cell.isWalkable = true;
+            }
+
+            setStart(col, row) {
+                if (!this.isWalkable(col, row)) return false;
+                if (col === this.destination.col && row === this.destination.row) return false;
+                this.start = { col, row };
+                return true;
+            }
+
+            setDestination(col, row) {
+                if (!this.isWalkable(col, row)) return false;
+                if (col === this.start.col && row === this.start.row) return false;
+                this.destination = { col, row };
+                return true;
+            }
+
+            clearAllObstacles() {
+                for (let r = 0; r < this.rows; r++) {
+                    for (let c = 0; c < this.cols; c++) {
+                        this.cells[r][c].type = CELL_TYPES.EMPTY;
+                        this.cells[r][c].isWalkable = true;
+                    }
+                }
+                if (this.mode === 'uneven') this.generateProceduralHeights();
+            }
+
+            applyPreset(name) {
+                this.clearAllObstacles();
+                const midCol = Math.floor(this.cols / 2);
+                const midRow = Math.floor(this.rows / 2);
+
+                this.start = { col: 3, row: midRow };
+                this.destination = { col: this.cols - 4, row: midRow };
+
+                if (name === 'easy') {
+                    this.setCellType(midCol - 3, midRow - 4, CELL_TYPES.ROCK);
+                    this.setCellType(midCol - 2, midRow - 4, CELL_TYPES.ROCK);
+                    this.setCellType(midCol + 3, midRow + 4, CELL_TYPES.BLOCK);
+                    this.setCellType(midCol + 4, midRow + 4, CELL_TYPES.BLOCK);
+                    this.setCellType(midCol, midRow + 1, CELL_TYPES.CRATER);
+                    this.setCellType(midCol, midRow - 1, CELL_TYPES.HILL);
+                    this.setCellType(midCol, midRow, CELL_TYPES.RESTRICTED_HIGH_COST);
+                } else if (name === 'medium') {
+                    for (let r = 5; r < this.rows - 5; r++) {
+                        if (r !== midRow - 3 && r !== midRow + 3) {
+                            this.setCellType(midCol, r, CELL_TYPES.WALL);
+                        } else if (r === midRow - 3) {
+                            this.setCellType(midCol, r, CELL_TYPES.RESTRICTED_HIGH_COST);
+                        }
+                    }
+                    this.setCellType(midCol - 5, midRow - 2, CELL_TYPES.ROCK);
+                    this.setCellType(midCol - 5, midRow - 3, CELL_TYPES.ROCK);
+                    this.setCellType(midCol + 5, midRow + 2, CELL_TYPES.BLOCK);
+                    this.setCellType(midCol + 5, midRow + 3, CELL_TYPES.BLOCK);
+                    this.setCellType(midCol - 3, midRow + 5, CELL_TYPES.CRATER);
+                    this.setCellType(midCol + 3, midRow - 5, CELL_TYPES.HILL);
+                    this.setCellType(midCol - 2, midRow + 6, CELL_TYPES.RESTRICTED_BLOCKED);
+                } else if (name === 'hard') {
+                    for (let r = 4; r < this.rows - 8; r++) this.setCellType(midCol - 6, r, CELL_TYPES.WALL);
+                    for (let r = 8; r < this.rows - 4; r++) this.setCellType(midCol + 6, r, CELL_TYPES.WALL);
+                    for (let c = midCol - 3; c <= midCol + 3; c++) {
+                        if (c !== midCol) {
+                            this.setCellType(c, midRow - 4, CELL_TYPES.BLOCK);
+                            this.setCellType(c, midRow + 4, CELL_TYPES.BLOCK);
+                        }
+                    }
+                    this.setCellType(midCol, midRow - 4, CELL_TYPES.RESTRICTED_HIGH_COST);
+                    this.setCellType(midCol, midRow, CELL_TYPES.RESTRICTED_HIGH_COST);
+                    this.setCellType(midCol - 1, midRow, CELL_TYPES.RESTRICTED_HIGH_COST);
+                    this.setCellType(midCol + 1, midRow, CELL_TYPES.RESTRICTED_HIGH_COST);
+                    this.setCellType(midCol, midRow + 4, CELL_TYPES.RESTRICTED_BLOCKED);
+                    this.setCellType(midCol - 2, midRow - 1, CELL_TYPES.ROCK);
+                    this.setCellType(midCol + 2, midRow + 1, CELL_TYPES.ROCK);
+                    this.setCellType(midCol - 4, midRow + 3, CELL_TYPES.CRATER);
+                    this.setCellType(midCol + 4, midRow - 3, CELL_TYPES.HILL);
+                } else if (name === 'random') {
+                    this.generateRandomObstacles(42);
+                }
+
+                if (this.mode === 'uneven') this.generateProceduralHeights();
+            }
+
+            generateRandomObstacles(count = 35) {
+                const types = [
+                    CELL_TYPES.ROCK, CELL_TYPES.BLOCK, CELL_TYPES.WALL,
+                    CELL_TYPES.CRATER, CELL_TYPES.HILL, CELL_TYPES.RESTRICTED_HIGH_COST
+                ];
+                let placed = 0, attempts = 0;
+                while (placed < count && attempts < count * 10) {
+                    attempts++;
+                    const c = Math.floor(Math.random() * this.cols);
+                    const r = Math.floor(Math.random() * this.rows);
+                    if (Math.hypot(c - this.start.col, r - this.start.row) < 2.5) continue;
+                    if (Math.hypot(c - this.destination.col, r - this.destination.row) < 2.5) continue;
+                    const cur = this.getCell(c, r);
+                    if (cur && cur.type === CELL_TYPES.EMPTY) {
+                        this.setCellType(c, r, types[Math.floor(Math.random() * types.length)]);
+                        placed++;
+                    }
+                }
+            }
+        }
+
+        /* 4. PATHFINDING */
+        function cellKey(col, row) { return col + ',' + row; }
+
+        function calculateHeuristic(col, row, destCol, destRow, grid) {
+            const dx = Math.abs(col - destCol);
+            const dz = Math.abs(row - destRow);
+            const D = MOVEMENT_COSTS.BASE;
+            const D2 = MOVEMENT_COSTS.DIAGONAL;
+            const octile2D = D * (dx + dz) + (D2 - 2 * D) * Math.min(dx, dz);
+            if (grid.mode === 'uneven') {
+                return octile2D + Math.abs(grid.getCellElevation(destCol, destRow) - grid.getCellElevation(col, row)) * 0.5;
+            }
+            return octile2D;
+        }
+
+        function reconstructPath(cameFrom, current) {
+            const total = [current];
+            let key = cellKey(current.col, current.row);
+            while (cameFrom.has(key)) {
+                current = cameFrom.get(key);
+                key = cellKey(current.col, current.row);
+                total.push(current);
+            }
+            return total.reverse();
+        }
+
+
+        /* PHYSICS-BASED ROVER FUEL ENGINE */
+        function calculateStepFuel(fromCol, fromRow, toCol, toRow, grid) {
+            const p1 = grid.gridToWorld(fromCol, fromRow);
+            const p2 = grid.gridToWorld(toCol, toRow);
+            const dx = p2.x - p1.x;
+            const dz = p2.z - p1.z;
+            const dist2D = Math.hypot(dx, dz);
+
+            const elev1 = grid.getCellElevation(fromCol, fromRow);
+            const elev2 = grid.getCellElevation(toCol, toRow);
+            const deltaH = elev2 - elev1;
+            const dist3D = Math.hypot(dist2D, deltaH);
+
+            const baseRate = 1.0; // 1.0 Liters/meter on level ground
+            let slopeRate = 1.0;
+
+            if (dist2D > 0.001) {
+                const grade = deltaH / dist2D; // rise over run
+                if (grade > 0) {
+                    // Ascending uphill slide/slope: work against gravity and tire slip
+                    slopeRate = 1.0 + 7.0 * grade + 15.0 * (grade * grade);
+                } else {
+                    // Descending downhill slide: gravity assist coasting
+                    slopeRate = Math.max(0.25, 1.0 - 0.65 * Math.abs(grade));
+                }
+            }
+
+            // Surface roughness drag
+            let drag = 1.0;
+            const targetCell = grid.getCell(toCol, toRow);
+            if (targetCell) {
+                if (targetCell.type === CELL_TYPES.RESTRICTED_HIGH_COST) drag = 1.8;
+                else if (targetCell.type === CELL_TYPES.CRATER) drag = 1.5;
+                else if (targetCell.type === CELL_TYPES.HILL) drag = 1.3;
+            }
+
+            return dist3D * baseRate * slopeRate * drag;
+        }
+
+        function calculateFuelHeuristic(col, row, destCol, destRow, grid) {
+            const dx = Math.abs(col - destCol);
+            const dz = Math.abs(row - destRow);
+            const D = 1.0, D2 = Math.SQRT2;
+            const octile2D = D * (dx + dz) + (D2 - 2 * D) * Math.min(dx, dz);
+            // Strictly admissible lower bound: min possible fuel is 0.25x distance
+            return octile2D * grid.cellSize * 0.25;
+        }
+
+        function calculatePathMetrics(path, grid) {
+            let distance = 0, totalCost = 0, totalFuel = 0, elevGain = 0;
+            for (let i = 0; i < path.length - 1; i++) {
+                const from = path[i];
+                const to = path[i + 1];
+                const p1 = grid.gridToWorld(from.col, from.row);
+                const p2 = grid.gridToWorld(to.col, to.row);
+                const stepDist = Math.hypot(p2.x - p1.x, p2.y - p1.y, p2.z - p1.z);
+                const stepCost = grid.getMovementCost(from.col, from.row, to.col, to.row);
+                const stepFuel = calculateStepFuel(from.col, from.row, to.col, to.row, grid);
+
+                distance += stepDist;
+                totalCost += stepCost;
+                totalFuel += stepFuel;
+                if (p2.y > p1.y) elevGain += (p2.y - p1.y);
+            }
+            return {
+                distance: parseFloat(distance.toFixed(2)),
+                totalCost: parseFloat(totalCost.toFixed(2)),
+                totalFuel: parseFloat(totalFuel.toFixed(2)),
+                elevGain: parseFloat(elevGain.toFixed(2))
+            };
+        }
+
+        /* DUAL PATH OPTIMIZATION: SHORTEST WAY (DISTANCE) VS BEST WAY (FUEL-OPTIMAL) */
+        function findPathShortest(grid, customStart = null, customDest = null, alg = 'A*') {
+            const startTime = performance.now();
+            const start = customStart || grid.start;
+            const destination = customDest || grid.destination;
+
+            if (!grid.isWalkable(start.col, start.row) || !grid.isWalkable(destination.col, destination.row)) {
+                return {
+                    success: false, algorithm: alg, mode: 'shortest', reason: 'Start or destination is blocked.',
+                    path: [], exploredNodes: [], nodesExplored: 0, distance: 0, cost: Infinity, fuel: Infinity, steps: 0,
+                    elevGain: 0, planningTimeMs: performance.now() - startTime
+                };
+            }
+
+            const openSet = new PriorityQueue();
+            const startKey = cellKey(start.col, start.row);
+            const gScore = new Map();
+            const cameFrom = new Map();
+            const inClosedSet = new Set();
+            const exploredNodes = [];
+
+            gScore.set(startKey, 0);
+            const initH = alg === 'A*' ? calculateHeuristic(start.col, start.row, destination.col, destination.row, grid) : 0;
+            openSet.push({ col: start.col, row: start.row }, initH);
+            let nodesExploredCount = 0;
+
+            while (!openSet.isEmpty()) {
+                const current = openSet.pop();
+                const currentKey = cellKey(current.col, current.row);
+                if (inClosedSet.has(currentKey)) continue;
+
+                inClosedSet.add(currentKey);
+                exploredNodes.push({ col: current.col, row: current.row });
+                nodesExploredCount++;
+
+                if (current.col === destination.col && current.row === destination.row) {
+                    const endTime = performance.now();
+                    const path = reconstructPath(cameFrom, current);
+                    const metrics = calculatePathMetrics(path, grid);
+                    return {
+                        success: true, algorithm: alg, mode: 'shortest', path, exploredNodes, nodesExplored: nodesExploredCount,
+                        distance: metrics.distance, cost: metrics.totalCost, fuel: metrics.totalFuel, elevGain: metrics.elevGain,
+                        steps: Math.max(0, path.length - 1), planningTimeMs: parseFloat((endTime - startTime).toFixed(2))
+                    };
+                }
+
+                for (const neighbor of grid.getNeighbors(current.col, current.row)) {
+                    const neighborKey = cellKey(neighbor.col, neighbor.row);
+                    if (inClosedSet.has(neighborKey)) continue;
+
+                    const p1 = grid.gridToWorld(current.col, current.row);
+                    const p2 = grid.gridToWorld(neighbor.col, neighbor.row);
+                    const elev1 = grid.getCellElevation(current.col, current.row);
+                    const elev2 = grid.getCellElevation(neighbor.col, neighbor.row);
+                    let stepCost = Math.hypot(p2.x - p1.x, p2.z - p1.z, elev2 - elev1);
+
+                    const targetCell = grid.getCell(neighbor.col, neighbor.row);
+                    if (targetCell && targetCell.type === CELL_TYPES.RESTRICTED_HIGH_COST) {
+                        stepCost *= 2.5;
+                    }
+
+                    const tentativeG = gScore.get(currentKey) + stepCost;
+                    const existingG = gScore.has(neighborKey) ? gScore.get(neighborKey) : Infinity;
+
+                    if (tentativeG < existingG) {
+                        cameFrom.set(neighborKey, current);
+                        gScore.set(neighborKey, tentativeG);
+                        const h = (alg === 'A*') ? calculateHeuristic(neighbor.col, neighbor.row, destination.col, destination.row, grid) : 0;
+                        openSet.push({ col: neighbor.col, row: neighbor.row }, tentativeG + h);
+                    }
+                }
+            }
+
+            return {
+                success: false, algorithm: alg, mode: 'shortest', reason: 'No valid route available.',
+                path: [], exploredNodes, nodesExplored: nodesExploredCount, distance: 0, cost: Infinity, fuel: Infinity, steps: 0,
+                elevGain: 0, planningTimeMs: parseFloat((performance.now() - startTime).toFixed(2))
+            };
+        }
+
+        function findPathBest(grid, customStart = null, customDest = null, alg = 'A*') {
+            const startTime = performance.now();
+            const start = customStart || grid.start;
+            const destination = customDest || grid.destination;
+
+            if (!grid.isWalkable(start.col, start.row) || !grid.isWalkable(destination.col, destination.row)) {
+                return {
+                    success: false, algorithm: alg, mode: 'best', reason: 'Start or destination is blocked.',
+                    path: [], exploredNodes: [], nodesExplored: 0, distance: 0, cost: Infinity, fuel: Infinity, steps: 0,
+                    elevGain: 0, planningTimeMs: performance.now() - startTime
+                };
+            }
+
+            const openSet = new PriorityQueue();
+            const startKey = cellKey(start.col, start.row);
+            const gScore = new Map();
+            const cameFrom = new Map();
+            const inClosedSet = new Set();
+            const exploredNodes = [];
+
+            gScore.set(startKey, 0);
+            const initH = (alg === 'A*') ? calculateFuelHeuristic(start.col, start.row, destination.col, destination.row, grid) : 0;
+            openSet.push({ col: start.col, row: start.row }, initH);
+            let nodesExploredCount = 0;
+
+            while (!openSet.isEmpty()) {
+                const current = openSet.pop();
+                const currentKey = cellKey(current.col, current.row);
+                if (inClosedSet.has(currentKey)) continue;
+
+                inClosedSet.add(currentKey);
+                exploredNodes.push({ col: current.col, row: current.row });
+                nodesExploredCount++;
+
+                if (current.col === destination.col && current.row === destination.row) {
+                    const endTime = performance.now();
+                    const path = reconstructPath(cameFrom, current);
+                    const metrics = calculatePathMetrics(path, grid);
+                    return {
+                        success: true, algorithm: alg, mode: 'best', path, exploredNodes, nodesExplored: nodesExploredCount,
+                        distance: metrics.distance, cost: metrics.totalCost, fuel: metrics.totalFuel, elevGain: metrics.elevGain,
+                        steps: Math.max(0, path.length - 1), planningTimeMs: parseFloat((endTime - startTime).toFixed(2))
+                    };
+                }
+
+                for (const neighbor of grid.getNeighbors(current.col, current.row)) {
+                    const neighborKey = cellKey(neighbor.col, neighbor.row);
+                    if (inClosedSet.has(neighborKey)) continue;
+
+                    const stepFuel = calculateStepFuel(current.col, current.row, neighbor.col, neighbor.row, grid);
+                    const tentativeG = gScore.get(currentKey) + stepFuel;
+                    const existingG = gScore.has(neighborKey) ? gScore.get(neighborKey) : Infinity;
+
+                    if (tentativeG < existingG) {
+                        cameFrom.set(neighborKey, current);
+                        gScore.set(neighborKey, tentativeG);
+                        const h = (alg === 'A*') ? calculateFuelHeuristic(neighbor.col, neighbor.row, destination.col, destination.row, grid) : 0;
+                        openSet.push({ col: neighbor.col, row: neighbor.row }, tentativeG + h);
+                    }
+                }
+            }
+
+            return {
+                success: false, algorithm: alg, mode: 'best', reason: 'No valid route available.',
+                path: [], exploredNodes, nodesExplored: nodesExploredCount, distance: 0, cost: Infinity, fuel: Infinity, steps: 0,
+                elevGain: 0, planningTimeMs: parseFloat((performance.now() - startTime).toFixed(2))
+            };
+        }
+
+
+        function findPathAStar(grid, customStart = null, customDest = null) {
+            const startTime = performance.now();
+            const start = customStart || grid.start;
+            const destination = customDest || grid.destination;
+
+            if (!grid.isWalkable(start.col, start.row) || !grid.isWalkable(destination.col, destination.row)) {
+                return {
+                    success: false, algorithm: 'A*', reason: 'Start or destination is blocked.',
+                    path: [], exploredNodes: [], nodesExplored: 0, distance: 0, cost: Infinity, steps: 0,
+                    planningTimeMs: performance.now() - startTime
+                };
+            }
+
+            const openSet = new PriorityQueue();
+            const startKey = cellKey(start.col, start.row);
+            const gScore = new Map();
+            const cameFrom = new Map();
+            const inClosedSet = new Set();
+            const exploredNodes = [];
+
+            gScore.set(startKey, 0);
+            openSet.push({ col: start.col, row: start.row }, calculateHeuristic(start.col, start.row, destination.col, destination.row, grid));
+            let nodesExploredCount = 0;
+
+            while (!openSet.isEmpty()) {
+                const current = openSet.pop();
+                const currentKey = cellKey(current.col, current.row);
+                if (inClosedSet.has(currentKey)) continue;
+
+                inClosedSet.add(currentKey);
+                exploredNodes.push({ col: current.col, row: current.row });
+                nodesExploredCount++;
+
+                if (current.col === destination.col && current.row === destination.row) {
+                    const endTime = performance.now();
+                    const path = reconstructPath(cameFrom, current);
+                    const { distance, totalCost } = calculatePathMetrics(path, grid);
+                    return {
+                        success: true, algorithm: 'A*', path, exploredNodes, nodesExplored: nodesExploredCount,
+                        distance: parseFloat(distance.toFixed(2)), cost: parseFloat(totalCost.toFixed(2)),
+                        steps: Math.max(0, path.length - 1), planningTimeMs: parseFloat((endTime - startTime).toFixed(2))
+                    };
+                }
+
+                for (const neighbor of grid.getNeighbors(current.col, current.row)) {
+                    const neighborKey = cellKey(neighbor.col, neighbor.row);
+                    if (inClosedSet.has(neighborKey)) continue;
+
+                    const tentativeG = gScore.get(currentKey) + grid.getMovementCost(current.col, current.row, neighbor.col, neighbor.row);
+                    const existingG = gScore.has(neighborKey) ? gScore.get(neighborKey) : Infinity;
+
+                    if (tentativeG < existingG) {
+                        cameFrom.set(neighborKey, current);
+                        gScore.set(neighborKey, tentativeG);
+                        const h = calculateHeuristic(neighbor.col, neighbor.row, destination.col, destination.row, grid);
+                        openSet.push({ col: neighbor.col, row: neighbor.row }, tentativeG + h);
+                    }
+                }
+            }
+
+            return {
+                success: false, algorithm: 'A*', reason: 'No valid route available.',
+                path: [], exploredNodes, nodesExplored: nodesExploredCount, distance: 0, cost: Infinity, steps: 0,
+                planningTimeMs: parseFloat((performance.now() - startTime).toFixed(2))
+            };
+        }
+
+        function findPathDijkstra(grid, customStart = null, customDest = null) {
+            const startTime = performance.now();
+            const start = customStart || grid.start;
+            const destination = customDest || grid.destination;
+
+            if (!grid.isWalkable(start.col, start.row) || !grid.isWalkable(destination.col, destination.row)) {
+                return {
+                    success: false, algorithm: 'Dijkstra', reason: 'Start or destination is blocked.',
+                    path: [], exploredNodes: [], nodesExplored: 0, distance: 0, cost: Infinity, steps: 0,
+                    planningTimeMs: performance.now() - startTime
+                };
+            }
+
+            const openSet = new PriorityQueue();
+            const startKey = cellKey(start.col, start.row);
+            const dist = new Map();
+            const cameFrom = new Map();
+            const visited = new Set();
+            const exploredNodes = [];
+
+            dist.set(startKey, 0);
+            openSet.push({ col: start.col, row: start.row }, 0);
+            let nodesExploredCount = 0;
+
+            while (!openSet.isEmpty()) {
+                const current = openSet.pop();
+                const currentKey = cellKey(current.col, current.row);
+                if (visited.has(currentKey)) continue;
+
+                visited.add(currentKey);
+                exploredNodes.push({ col: current.col, row: current.row });
+                nodesExploredCount++;
+
+                if (current.col === destination.col && current.row === destination.row) {
+                    const endTime = performance.now();
+                    const path = reconstructPath(cameFrom, current);
+                    const { distance, totalCost } = calculatePathMetrics(path, grid);
+                    return {
+                        success: true, algorithm: 'Dijkstra', path, exploredNodes, nodesExplored: nodesExploredCount,
+                        distance: parseFloat(distance.toFixed(2)), cost: parseFloat(totalCost.toFixed(2)),
+                        steps: Math.max(0, path.length - 1), planningTimeMs: parseFloat((endTime - startTime).toFixed(2))
+                    };
+                }
+
+                for (const neighbor of grid.getNeighbors(current.col, current.row)) {
+                    const neighborKey = cellKey(neighbor.col, neighbor.row);
+                    if (visited.has(neighborKey)) continue;
+
+                    const newDist = dist.get(currentKey) + grid.getMovementCost(current.col, current.row, neighbor.col, neighbor.row);
+                    if (newDist < (dist.has(neighborKey) ? dist.get(neighborKey) : Infinity)) {
+                        dist.set(neighborKey, newDist);
+                        cameFrom.set(neighborKey, current);
+                        openSet.push({ col: neighbor.col, row: neighbor.row }, newDist);
+                    }
+                }
+            }
+
+            return {
+                success: false, algorithm: 'Dijkstra', reason: 'No valid route available.',
+                path: [], exploredNodes, nodesExplored: nodesExploredCount, distance: 0, cost: Infinity, steps: 0,
+                planningTimeMs: parseFloat((performance.now() - startTime).toFixed(2))
+            };
+        }
+
+        /* 5. 3D TERRAIN VIEW */
+        class TerrainView {
+            constructor(scene, grid) {
+                this.scene = scene;
+                this.grid = grid;
+                this.terrainGroup = new THREE.Group();
+                this.obstaclesGroup = new THREE.Group();
+                this.markersGroup = new THREE.Group();
+                this.pathGroup = new THREE.Group();
+                this.exploredGroup = new THREE.Group();
+
+                this.scene.add(this.terrainGroup);
+                this.scene.add(this.obstaclesGroup);
+                this.scene.add(this.markersGroup);
+                this.scene.add(this.pathGroup);
+                this.scene.add(this.exploredGroup);
+
+                this.groundMesh = null;
+                this.obstacleMeshes = new Map();
+                this.startMarker = null;
+                this.destinationMarker = null;
+                this.pathMode = 'smooth';
+
+                this.initMaterials();
+                this.buildTerrainMesh();
+                this.buildMarkers();
+                this.syncObstacles();
+            }
+
+            initMaterials() {
+                this.materials = {
+                    terrain: new THREE.MeshStandardMaterial({
+                        color: COLORS.TERRAIN_MID, roughness: 0.85, metalness: 0.15, flatShading: true, vertexColors: true
+                    }),
+                    wireframe: new THREE.LineBasicMaterial({ color: COLORS.GRID_LINE, transparent: true, opacity: 0.4 }),
+                    rock: new THREE.MeshStandardMaterial({ color: COLORS.OBSTACLE_ROCK, roughness: 0.9, metalness: 0.1, flatShading: true }),
+                    block: new THREE.MeshStandardMaterial({ color: COLORS.OBSTACLE_BLOCK, roughness: 0.4, metalness: 0.6 }),
+                    wall: new THREE.MeshStandardMaterial({ color: COLORS.OBSTACLE_WALL, roughness: 0.5, metalness: 0.3 }),
+                    crater: new THREE.MeshStandardMaterial({ color: COLORS.OBSTACLE_CRATER, roughness: 0.95, metalness: 0.05 }),
+                    hill: new THREE.MeshStandardMaterial({ color: 0x3b4a6b, roughness: 0.8, metalness: 0.2, flatShading: true }),
+                    restrictedBlocked: new THREE.MeshStandardMaterial({ color: COLORS.RESTRICTED_BLOCKED, transparent: true, opacity: 0.65 }),
+                    restrictedHighCost: new THREE.MeshStandardMaterial({ color: COLORS.RESTRICTED_HIGH_COST, transparent: true, opacity: 0.45 }),
+                    startMarker: new THREE.MeshStandardMaterial({ color: COLORS.START_MARKER, emissive: COLORS.START_MARKER, emissiveIntensity: 0.6 }),
+                    destMarker: new THREE.MeshStandardMaterial({ color: COLORS.DESTINATION_MARKER, emissive: COLORS.DESTINATION_MARKER, emissiveIntensity: 0.6 }),
+                    pathLineAStar: new THREE.MeshBasicMaterial({ color: COLORS.PATH_LINE }),
+                    pathLineDijkstra: new THREE.MeshBasicMaterial({ color: COLORS.PATH_LINE_DIJKSTRA }),
+                    pathTile: new THREE.MeshBasicMaterial({ color: COLORS.PATH_CELL_HIGHLIGHT, transparent: true, opacity: 0.35, side: THREE.DoubleSide }),
+                    exploredTile: new THREE.MeshBasicMaterial({ color: COLORS.EXPLORED_NODE, transparent: true, opacity: 0.25, side: THREE.DoubleSide })
+                };
+            }
+
+            buildTerrainMesh() {
+                while (this.terrainGroup.children.length > 0) {
+                    const child = this.terrainGroup.children[0];
+                    this.terrainGroup.remove(child);
+                    if (child.geometry) child.geometry.dispose();
+                }
+
+                const totalW = (this.grid.cols - 1) * this.grid.cellSize;
+                const totalD = (this.grid.rows - 1) * this.grid.cellSize;
+                const geometry = new THREE.PlaneGeometry(totalW, totalD, this.grid.cols - 1, this.grid.rows - 1);
+                geometry.rotateX(-Math.PI / 2);
+
+                const posAttr = geometry.attributes.position;
+                const colors = [];
+
+                for (let i = 0; i < posAttr.count; i++) {
+                    const col = i % this.grid.cols;
+                    const row = Math.floor(i / this.grid.cols);
+                    const elev = this.grid.getCellElevation(col, row);
+                    posAttr.setY(i, elev);
+
+                    const color = new THREE.Color();
+                    if (this.grid.mode === 'uneven') {
+                        const norm = (elev - (-1.8)) / (3.5 - (-1.8));
+                        color.lerpColors(new THREE.Color(COLORS.TERRAIN_LOW), new THREE.Color(COLORS.TERRAIN_HIGH), Math.max(0, Math.min(1, norm)));
+                    } else {
+                        color.setHex(COLORS.TERRAIN_MID);
+                    }
+                    colors.push(color.r, color.g, color.b);
+                }
+
+                posAttr.needsUpdate = true;
+                geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+                geometry.computeVertexNormals();
+
+                this.groundMesh = new THREE.Mesh(geometry, this.materials.terrain);
+                this.groundMesh.receiveShadow = true;
+                this.terrainGroup.add(this.groundMesh);
+
+                const wireframe = new THREE.LineSegments(new THREE.WireframeGeometry(geometry), this.materials.wireframe);
+                wireframe.position.y += 0.01;
+                this.terrainGroup.add(wireframe);
+            }
+
+            buildMarkers() {
+                while (this.markersGroup.children.length > 0) {
+                    this.markersGroup.remove(this.markersGroup.children[0]);
+                }
+
+                this.startMarker = new THREE.Group();
+                this.startMarker.name = 'StartMarker';
+                const baseCyl = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.9, 0.4, 24), this.materials.startMarker);
+                baseCyl.position.y = 0.2;
+                this.startMarker.add(baseCyl);
+                const pin = new THREE.Mesh(new THREE.ConeGeometry(0.4, 1.4, 16), this.materials.startMarker);
+                pin.position.y = 1.1;
+                pin.rotation.x = Math.PI;
+                this.startMarker.add(pin);
+                this.markersGroup.add(this.startMarker);
+
+                this.destinationMarker = new THREE.Group();
+                this.destinationMarker.name = 'DestinationMarker';
+                const ring = new THREE.Mesh(new THREE.TorusGeometry(0.9, 0.2, 12, 24), this.materials.destMarker);
+                ring.rotation.x = Math.PI / 2;
+                ring.position.y = 0.2;
+                this.destinationMarker.add(ring);
+                const destPin = new THREE.Mesh(new THREE.ConeGeometry(0.45, 1.5, 16), this.materials.destMarker);
+                destPin.position.y = 1.2;
+                destPin.rotation.x = Math.PI;
+                this.destinationMarker.add(destPin);
+                this.markersGroup.add(this.destinationMarker);
+
+                this.updateMarkerPositions();
+            }
+
+            updateMarkerPositions() {
+                if (!this.startMarker || !this.destinationMarker) return;
+                const sp = this.grid.gridToWorld(this.grid.start.col, this.grid.start.row);
+                this.startMarker.position.set(sp.x, sp.y, sp.z);
+                const dp = this.grid.gridToWorld(this.grid.destination.col, this.grid.destination.row);
+                this.destinationMarker.position.set(dp.x, dp.y, dp.z);
+            }
+
+            syncObstacles() {
+                this.obstacleMeshes.forEach(mesh => {
+                    this.obstaclesGroup.remove(mesh);
+                    if (mesh.geometry) mesh.geometry.dispose();
+                });
+                this.obstacleMeshes.clear();
+
+                for (let r = 0; r < this.grid.rows; r++) {
+                    for (let c = 0; c < this.grid.cols; c++) {
+                        const cell = this.grid.getCell(c, r);
+                        if (cell && cell.type !== CELL_TYPES.EMPTY) {
+                            this.createObstacleMesh(c, r, cell.type);
+                        }
+                    }
+                }
+            }
+
+
+            updateFogVisibility() {
+                this.obstacleMeshes.forEach((mesh, key) => {
+                    const [c, r] = key.split(',').map(Number);
+                    if (!this.grid.fogOfWar || this.grid.isCellDiscovered(c, r)) {
+                        if (!mesh.visible) {
+                            mesh.visible = true;
+                            mesh.scale.set(0.1, 0.1, 0.1);
+                            const t0 = performance.now();
+                            const pop = () => {
+                                const el = (performance.now() - t0) / 220;
+                                if (el < 1.0) {
+                                    const s = 0.1 + el * 0.9;
+                                    mesh.scale.set(s, s, s);
+                                    requestAnimationFrame(pop);
+                                } else {
+                                    mesh.scale.set(1, 1, 1);
+                                }
+                            };
+                            requestAnimationFrame(pop);
+                        }
+                    } else {
+                        mesh.visible = false;
+                    }
+                });
+            }
+
+            createObstacleMesh(col, row, type) {
+                const key = col + ',' + row;
+                const wp = this.grid.gridToWorld(col, row);
+                let mesh = null;
+                const size = this.grid.cellSize * 0.85;
+
+                switch (type) {
+                    case CELL_TYPES.ROCK: {
+                        mesh = new THREE.Mesh(new THREE.DodecahedronGeometry(size * 0.55, 1), this.materials.rock);
+                        mesh.position.set(wp.x, wp.y + size * 0.45, wp.z);
+                        mesh.castShadow = true;
+                        break;
+                    }
+                    case CELL_TYPES.BLOCK: {
+                        mesh = new THREE.Mesh(new THREE.BoxGeometry(size, size * 0.9, size), this.materials.block);
+                        mesh.position.set(wp.x, wp.y + size * 0.45, wp.z);
+                        mesh.castShadow = true;
+                        break;
+                    }
+                    case CELL_TYPES.WALL: {
+                        mesh = new THREE.Mesh(new THREE.BoxGeometry(size, size * 1.3, size), this.materials.wall);
+                        mesh.position.set(wp.x, wp.y + size * 0.65, wp.z);
+                        mesh.castShadow = true;
+                        break;
+                    }
+                    case CELL_TYPES.CRATER: {
+                        mesh = new THREE.Mesh(new THREE.TorusGeometry(size * 0.5, size * 0.18, 12, 24), this.materials.crater);
+                        mesh.rotation.x = Math.PI / 2;
+                        mesh.position.set(wp.x, wp.y + 0.1, wp.z);
+                        break;
+                    }
+                    case CELL_TYPES.HILL: {
+                        mesh = new THREE.Mesh(new THREE.ConeGeometry(size * 0.7, size * 1.1, 16), this.materials.hill);
+                        mesh.position.set(wp.x, wp.y + size * 0.55, wp.z);
+                        mesh.castShadow = true;
+                        break;
+                    }
+                    case CELL_TYPES.RESTRICTED_BLOCKED: {
+                        const grp = new THREE.Group();
+                        const t = new THREE.Mesh(new THREE.PlaneGeometry(this.grid.cellSize * 0.95, this.grid.cellSize * 0.95), this.materials.restrictedBlocked);
+                        t.rotation.x = -Math.PI / 2;
+                        t.position.y = 0.05;
+                        grp.add(t);
+                        const b = new THREE.Mesh(new THREE.BoxGeometry(size * 0.9, 0.4, size * 0.9), this.materials.restrictedBlocked);
+                        b.position.y = 0.25;
+                        grp.add(b);
+                        grp.position.set(wp.x, wp.y, wp.z);
+                        mesh = grp;
+                        break;
+                    }
+                    case CELL_TYPES.RESTRICTED_HIGH_COST: {
+                        const grp = new THREE.Group();
+                        const tg = new THREE.PlaneGeometry(this.grid.cellSize * 0.95, this.grid.cellSize * 0.95);
+                        const t = new THREE.Mesh(tg, this.materials.restrictedHighCost);
+                        t.rotation.x = -Math.PI / 2;
+                        t.position.y = 0.05;
+                        grp.add(t);
+                        const el = new THREE.LineSegments(new THREE.EdgesGeometry(tg), new THREE.LineBasicMaterial({ color: COLORS.RESTRICTED_HIGH_COST }));
+                        el.rotation.x = -Math.PI / 2;
+                        el.position.y = 0.07;
+                        grp.add(el);
+                        grp.position.set(wp.x, wp.y, wp.z);
+                        mesh = grp;
+                        break;
+                    }
+                }
+
+                if (mesh) {
+                    mesh.userData = { col, row, type };
+                    this.obstaclesGroup.add(mesh);
+                    this.obstacleMeshes.set(key, mesh);
+                }
+            }
+
+            removeObstacleMesh(col, row) {
+                const key = col + ',' + row;
+                const mesh = this.obstacleMeshes.get(key);
+                if (mesh) {
+                    this.obstaclesGroup.remove(mesh);
+                    if (mesh.geometry) mesh.geometry.dispose();
+                    this.obstacleMeshes.delete(key);
+                }
+            }
+
+            renderPath(path, exploredNodes = [], algorithm = 'A*') {
+                this.clearPath();
+
+                if (exploredNodes && exploredNodes.length > 0) {
+                    const tg = new THREE.PlaneGeometry(this.grid.cellSize * 0.88, this.grid.cellSize * 0.88);
+                    tg.rotateX(-Math.PI / 2);
+                    exploredNodes.forEach(node => {
+                        if ((node.col === this.grid.start.col && node.row === this.grid.start.row) ||
+                            (node.col === this.grid.destination.col && node.row === this.grid.destination.row)) return;
+                        const wp = this.grid.gridToWorld(node.col, node.row);
+                        const m = new THREE.Mesh(tg, this.materials.exploredTile);
+                        m.position.set(wp.x, wp.y + 0.02, wp.z);
+                        this.exploredGroup.add(m);
+                    });
+                }
+
+                if (path && path.length > 0) {
+                    const tg = new THREE.PlaneGeometry(this.grid.cellSize * 0.9, this.grid.cellSize * 0.9);
+                    tg.rotateX(-Math.PI / 2);
+                    path.forEach(node => {
+                        const wp = this.grid.gridToWorld(node.col, node.row);
+                        const m = new THREE.Mesh(tg, this.materials.pathTile);
+                        m.position.set(wp.x, wp.y + 0.04, wp.z);
+                        this.pathGroup.add(m);
+                    });
+
+                    const points = path.map(node => {
+                        const wp = this.grid.gridToWorld(node.col, node.row);
+                        return new THREE.Vector3(wp.x, wp.y + 0.35, wp.z);
+                    });
+
+                    if (points.length >= 2) {
+                        const mat = algorithm === 'Dijkstra' ? this.materials.pathLineDijkstra : this.materials.pathLineAStar;
+                        if (this.pathMode === 'grid') {
+                            const curvePath = new THREE.CurvePath();
+                            for (let i = 0; i < points.length - 1; i++) {
+                                curvePath.add(new THREE.LineCurve3(points[i], points[i + 1]));
+                            }
+                            this.pathGroup.add(new THREE.Mesh(new THREE.TubeGeometry(curvePath, points.length * 4, 0.14, 8, false), mat));
+                        } else {
+                            const curve = new THREE.CatmullRomCurve3(points, false, 'centripetal', 0.5);
+                            this.pathGroup.add(new THREE.Mesh(new THREE.TubeGeometry(curve, points.length * 8, 0.14, 8, false), mat));
+
+                            const ringGeo = new THREE.RingGeometry(0.16, 0.28, 16);
+                            ringGeo.rotateX(-Math.PI / 2);
+                            const ringMat = new THREE.MeshBasicMaterial({ color: algorithm === 'Dijkstra' ? 0xa855f7 : 0x06b6d4, transparent: true, opacity: 0.55, side: THREE.DoubleSide });
+                            points.forEach(pt => {
+                                const rm = new THREE.Mesh(ringGeo, ringMat);
+                                rm.position.set(pt.x, pt.y - 0.28, pt.z);
+                                this.pathGroup.add(rm);
+                            });
+                        }
+                    }
+                }
+            }
+
+            renderDualComparativePaths(bestPath, shortestPath, activeMode = 'best') {
+                this.clearPath();
+
+                // 1. Render Shortest Path (Neon Amber)
+                if (shortestPath && shortestPath.length >= 2) {
+                    const spPoints = shortestPath.map(n => {
+                        const wp = this.grid.gridToWorld(n.col, n.row);
+                        const groundY = this.grid.getExactElevation(wp.x, wp.z);
+                        return new THREE.Vector3(wp.x, groundY + (activeMode === 'shortest' ? 0.35 : 0.42), wp.z);
+                    });
+                    const spCurve = new THREE.CatmullRomCurve3(spPoints, false, 'centripetal', 0.5);
+                    const spRadius = (activeMode === 'shortest') ? 0.15 : 0.085;
+                    const spMat = new THREE.MeshBasicMaterial({
+                        color: COLORS.PATH_LINE_SHORTEST || 0xf59e0b,
+                        transparent: true,
+                        opacity: (activeMode === 'shortest') ? 1.0 : 0.55
+                    });
+                    this.pathGroup.add(new THREE.Mesh(new THREE.TubeGeometry(spCurve, spPoints.length * 8, spRadius, 8, false), spMat));
+
+                    if (activeMode === 'shortest') {
+                        const ringGeo = new THREE.RingGeometry(0.14, 0.26, 16);
+                        ringGeo.rotateX(-Math.PI / 2);
+                        const ringMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.6, side: THREE.DoubleSide });
+                        spPoints.forEach(pt => {
+                            const rm = new THREE.Mesh(ringGeo, ringMat);
+                            rm.position.set(pt.x, pt.y - 0.25, pt.z);
+                            this.pathGroup.add(rm);
+                        });
+                    }
+                }
+
+                // 2. Render Best (Fuel-Optimal) Path (Electric Cyan)
+                if (bestPath && bestPath.length >= 2) {
+                    const bpPoints = bestPath.map(n => {
+                        const wp = this.grid.gridToWorld(n.col, n.row);
+                        const groundY = this.grid.getExactElevation(wp.x, wp.z);
+                        return new THREE.Vector3(wp.x, groundY + (activeMode === 'best' ? 0.35 : 0.42), wp.z);
+                    });
+                    const bpCurve = new THREE.CatmullRomCurve3(bpPoints, false, 'centripetal', 0.5);
+                    const bpRadius = (activeMode === 'best') ? 0.15 : 0.085;
+                    const bpMat = new THREE.MeshBasicMaterial({
+                        color: COLORS.PATH_LINE_BEST || 0x06b6d4,
+                        transparent: true,
+                        opacity: (activeMode === 'best') ? 1.0 : 0.55
+                    });
+                    this.pathGroup.add(new THREE.Mesh(new THREE.TubeGeometry(bpCurve, bpPoints.length * 8, bpRadius, 8, false), bpMat));
+
+                    if (activeMode === 'best') {
+                        const ringGeo = new THREE.RingGeometry(0.14, 0.26, 16);
+                        ringGeo.rotateX(-Math.PI / 2);
+                        const ringMat = new THREE.MeshBasicMaterial({ color: 0x06b6d4, transparent: true, opacity: 0.6, side: THREE.DoubleSide });
+                        bpPoints.forEach(pt => {
+                            const rm = new THREE.Mesh(ringGeo, ringMat);
+                            rm.position.set(pt.x, pt.y - 0.25, pt.z);
+                            this.pathGroup.add(rm);
+                        });
+                    }
+                }
+            }
+
+            renderDualPaths(aStarPath, dijkstraPath) {
+                this.clearPath();
+                if (aStarPath && aStarPath.length >= 2) {
+                    const ap = aStarPath.map(n => {
+                        const wp = this.grid.gridToWorld(n.col, n.row);
+                        return new THREE.Vector3(wp.x, wp.y + 0.35, wp.z);
+                    });
+                    this.pathGroup.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(ap), ap.length * 6, 0.14, 8, false), this.materials.pathLineAStar));
+                }
+                if (dijkstraPath && dijkstraPath.length >= 2) {
+                    const dp = dijkstraPath.map(n => {
+                        const wp = this.grid.gridToWorld(n.col, n.row);
+                        return new THREE.Vector3(wp.x, wp.y + 0.48, wp.z);
+                    });
+                    this.pathGroup.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(dp), dp.length * 6, 0.12, 8, false), this.materials.pathLineDijkstra));
+                }
+            }
+
+            clearPath() {
+                while (this.pathGroup.children.length > 0) {
+                    const c = this.pathGroup.children[0];
+                    this.pathGroup.remove(c);
+                    if (c.geometry) c.geometry.dispose();
+                }
+                while (this.exploredGroup.children.length > 0) {
+                    const c = this.exploredGroup.children[0];
+                    this.exploredGroup.remove(c);
+                    if (c.geometry) c.geometry.dispose();
+                }
+            }
+        }
+
+        /* 6. 3D ROVER */
+        class Rover {
+            constructor(scene, grid) {
+                this.scene = scene;
+                this.grid = grid;
+                this.group = new THREE.Group();
+                this.group.name = 'AutonomousRover';
+                this.scene.add(this.group);
+                this.currentCol = grid.start.col;
+                this.currentRow = grid.start.row;
+                this.wheels = [];
+                this.lidarDome = null;
+                this.targetYaw = 0;
+                this.currentYaw = 0;
+                this.targetPitch = 0;
+                this.currentPitch = 0;
+                this.targetRoll = 0;
+                this.currentRoll = 0;
+                this.buildModel();
+                this.resetToStart();
+            }
+
+            buildModel() {
+                // High-visibility materials
+                const bodyMat = new THREE.MeshStandardMaterial({
+                    color: 0xf8fafc, // Bright lunar white
+                    roughness: 0.3,
+                    metalness: 0.45
+                });
+                const chassisMat = new THREE.MeshStandardMaterial({
+                    color: 0x1e293b, // Dark titanium chassis
+                    roughness: 0.6,
+                    metalness: 0.65
+                });
+                const accentMat = new THREE.MeshStandardMaterial({
+                    color: 0x06b6d4, // Vibrant electric cyan
+                    roughness: 0.25,
+                    metalness: 0.7,
+                    emissive: 0x06b6d4,
+                    emissiveIntensity: 0.35
+                });
+                const solarMat = new THREE.MeshStandardMaterial({
+                    color: 0x1d4ed8, // Deep cobalt solar panel array
+                    roughness: 0.2,
+                    metalness: 0.8
+                });
+                const tireMat = new THREE.MeshStandardMaterial({
+                    color: 0x0f172a, // Deep charcoal rubber
+                    roughness: 0.9,
+                    metalness: 0.1
+                });
+                const rimMat = new THREE.MeshStandardMaterial({
+                    color: 0x94a3b8, // Silver alloy rims
+                    roughness: 0.3,
+                    metalness: 0.8
+                });
+
+                // 1. Lower Chassis
+                const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.26, 1.8), chassisMat);
+                chassis.position.y = 0.42;
+                chassis.castShadow = true;
+                this.group.add(chassis);
+
+                // 2. Main Science Body
+                const body = new THREE.Mesh(new THREE.BoxGeometry(1.05, 0.4, 1.35), bodyMat);
+                body.position.y = 0.72;
+                body.castShadow = true;
+                this.group.add(body);
+
+                // 3. Solar Panel Roof Array
+                const solar = new THREE.Mesh(new THREE.BoxGeometry(1.12, 0.04, 1.15), solarMat);
+                solar.position.set(0, 0.94, 0.05);
+                this.group.add(solar);
+
+                // 4. Accent Trim
+                const strip = new THREE.Mesh(new THREE.BoxGeometry(1.08, 0.08, 0.32), accentMat);
+                strip.position.set(0, 0.82, -0.22);
+                this.group.add(strip);
+
+                // 5. Sensor Mast
+                const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.05, 0.65, 8), chassisMat);
+                mast.position.set(0.3, 1.25, -0.4);
+                this.group.add(mast);
+
+                // 6. Rotating Panoramic Dome & LIDAR Head
+                this.lidarDome = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.16, 0.22, 16), accentMat);
+                this.lidarDome.position.set(0.3, 1.58, -0.4);
+                this.group.add(this.lidarDome);
+
+                // 7. Translucent Scanning LIDAR Cone
+                const coneGeo = new THREE.ConeGeometry(3.5, 7.0, 24, 1, true);
+                coneGeo.rotateX(-Math.PI / 2);
+                coneGeo.translate(0, 0, -3.5);
+                const coneMat = new THREE.MeshBasicMaterial({
+                    color: 0x06b6d4,
+                    transparent: true,
+                    opacity: 0.16,
+                    side: THREE.DoubleSide,
+                    depthWrite: false
+                });
+                this.lidarCone = new THREE.Mesh(coneGeo, coneMat);
+                this.lidarDome.add(this.lidarCone);
+
+                // 8. Ground Radar Pulse Ring
+                const ringGeo = new THREE.RingGeometry(0.2, 5.0, 32);
+                ringGeo.rotateX(-Math.PI / 2);
+                const ringMat = new THREE.MeshBasicMaterial({
+                    color: 0x06b6d4,
+                    transparent: true,
+                    opacity: 0.22,
+                    side: THREE.DoubleSide,
+                    depthWrite: false
+                });
+                this.radarRing = new THREE.Mesh(ringGeo, ringMat);
+                this.radarRing.position.y = 0.05;
+                this.group.add(this.radarRing);
+
+                // 9. Six-Wheel Rocker-Bogie Heavy Terrain Suspension
+                const wheelPositions = [
+                    { x: -0.82, y: 0.36, z: -0.65 }, { x: 0.82, y: 0.36, z: -0.65 }, // Front
+                    { x: -0.85, y: 0.34, z: 0.0 },   { x: 0.85, y: 0.34, z: 0.0 },   // Mid
+                    { x: -0.82, y: 0.36, z: 0.65 },  { x: 0.82, y: 0.36, z: 0.65 }   // Rear
+                ];
+                this.wheels = [];
+                wheelPositions.forEach(pos => {
+                    const wg = new THREE.Group();
+                    wg.position.set(pos.x, pos.y, pos.z);
+
+                    // Tire
+                    const tg = new THREE.CylinderGeometry(0.36, 0.36, 0.24, 20);
+                    tg.rotateZ(Math.PI / 2);
+                    const tm = new THREE.Mesh(tg, tireMat);
+                    tm.castShadow = true;
+                    wg.add(tm);
+
+                    // Silver Rim Hubcap
+                    const hg = new THREE.CylinderGeometry(0.2, 0.2, 0.26, 12);
+                    hg.rotateZ(Math.PI / 2);
+                    wg.add(new THREE.Mesh(hg, rimMat));
+
+                    this.group.add(wg);
+                    this.wheels.push(wg);
+                });
+
+                // 10. Dual Front Headlights
+                const spotLeft = new THREE.SpotLight(0xa5f3fc, 1.8, 16, Math.PI / 6, 0.4, 1.2);
+                spotLeft.position.set(-0.35, 0.65, -0.75);
+                const targetL = new THREE.Object3D();
+                targetL.position.set(-0.35, 0, -8);
+                this.group.add(targetL);
+                spotLeft.target = targetL;
+                this.group.add(spotLeft);
+
+                const spotRight = new THREE.SpotLight(0xa5f3fc, 1.8, 16, Math.PI / 6, 0.4, 1.2);
+                spotRight.position.set(0.35, 0.65, -0.75);
+                const targetR = new THREE.Object3D();
+                targetR.position.set(0.35, 0, -8);
+                this.group.add(targetR);
+                spotRight.target = targetR;
+                this.group.add(spotRight);
+
+                // 11. Mast LED Beacon & Illuminator (Flashing Cyan / Emerald Status Beacon)
+                const beaconGeo = new THREE.SphereGeometry(0.12, 16, 16);
+                const beaconMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
+                this.beaconMesh = new THREE.Mesh(beaconGeo, beaconMat);
+                this.beaconMesh.position.set(0.3, 1.76, -0.4);
+                this.group.add(this.beaconMesh);
+
+                this.beaconLight = new THREE.PointLight(0x38bdf8, 1.6, 12);
+                this.beaconLight.position.set(0.3, 1.76, -0.4);
+                this.group.add(this.beaconLight);
+
+                // Prominent vehicle scale: 1.3x for clear visibility across landscape
+                this.group.scale.set(1.3, 1.3, 1.3);
+            }
+
+            resetToStart() {
+                this.currentCol = this.grid.start.col;
+                this.currentRow = this.grid.start.row;
+                const wp = this.grid.gridToWorld(this.currentCol, this.currentRow);
+                const groundY = this.grid.getExactElevation(wp.x, wp.z);
+                this.group.position.set(wp.x, groundY, wp.z);
+                const dp = this.grid.gridToWorld(this.grid.destination.col, this.grid.destination.row);
+                this.targetYaw = Math.atan2(dp.x - wp.x, dp.z - wp.z) + Math.PI;
+                this.currentYaw = this.targetYaw;
+                this.targetPitch = 0;
+                this.currentPitch = 0;
+                this.targetRoll = 0;
+                this.currentRoll = 0;
+                this.group.rotation.order = 'YXZ';
+                this.group.rotation.set(0, this.currentYaw, 0);
+            }
+
+            updatePosition(wx, wy, wz, dir = null) {
+                const groundY = this.grid.getExactElevation(wx, wz);
+                this.group.position.set(wx, groundY, wz);
+
+                if (dir && (Math.abs(dir.x) > 0.0001 || Math.abs(dir.z) > 0.0001)) {
+                    this.targetYaw = Math.atan2(-dir.x, -dir.z);
+                    let diff = this.targetYaw - this.currentYaw;
+                    while (diff > Math.PI) diff -= Math.PI * 2;
+                    while (diff < -Math.PI) diff += Math.PI * 2;
+                    this.currentYaw += diff * 0.18;
+
+                    if (this.grid.mode === 'uneven') {
+                        const norm = this.grid.getTerrainNormal(wx, wz);
+                        const fwdX = -Math.sin(this.currentYaw);
+                        const fwdZ = -Math.cos(this.currentYaw);
+                        const rightX = -Math.cos(this.currentYaw);
+                        const rightZ = Math.sin(this.currentYaw);
+
+                        const fwdSlope = norm.slopeX * fwdX + norm.slopeZ * fwdZ;
+                        const rightSlope = norm.slopeX * rightX + norm.slopeZ * rightZ;
+
+                        // Pitch: tilt nose up when climbing hills, down when descending
+                        this.targetPitch = -Math.atan(fwdSlope);
+                        // Roll: bank sideways into banked slopes
+                        this.targetRoll = Math.atan(rightSlope);
+                    } else {
+                        this.targetPitch = 0;
+                        this.targetRoll = 0;
+                    }
+                }
+
+                // Smooth suspension damping
+                this.currentPitch += (this.targetPitch - this.currentPitch) * 0.16;
+                this.currentRoll += (this.targetRoll - this.currentRoll) * 0.16;
+
+                this.group.rotation.order = 'YXZ';
+                this.group.rotation.y = this.currentYaw;
+                this.group.rotation.x = this.currentPitch;
+                this.group.rotation.z = this.currentRoll;
+            }
+
+            setLidarVisible(visible) {
+                if (this.lidarCone) this.lidarCone.visible = visible;
+                if (this.radarRing) this.radarRing.visible = visible;
+            }
+
+            animate(dt, isMoving = false, speed = 1.0) {
+                if (this.lidarDome) this.lidarDome.rotation.y += dt * 3.5;
+                if (this.beaconLight) {
+                    this.beaconTime = (this.beaconTime || 0) + dt * 4.0;
+                    const pulse = 0.7 + Math.sin(this.beaconTime) * 0.6;
+                    this.beaconLight.intensity = pulse * 1.8;
+                }
+                if (this.radarRing && this.radarRing.visible) {
+                    this.radarPulseTime = (this.radarPulseTime || 0) + dt * 1.5;
+                    const cycle = this.radarPulseTime % 1.0;
+                    const scale = 0.2 + cycle * 0.8;
+                    this.radarRing.scale.set(scale, scale, 1);
+                    this.radarRing.material.opacity = (1 - cycle) * 0.35;
+                }
+                if (isMoving && this.wheels.length > 0) {
+                    const roll = dt * speed * 4.5;
+                    this.wheels.forEach(w => { w.children[0].rotation.x += roll; });
+                }
+            }
+        }
+
+        /* 7. SIMULATION CONTROLLER */
+        class Simulation {
+            constructor(grid, terrainView, rover, onMetricsUpdate, onStatusChange, onNotification, backendClient = null) {
+                this.backendClient = backendClient;
+                this.grid = grid;
+                this.terrainView = terrainView;
+                this.rover = rover;
+                this.onMetricsUpdate = onMetricsUpdate;
+                this.onStatusChange = onStatusChange;
+                this.onNotification = onNotification;
+
+                this.algorithm = 'A*';
+                this.state = 'IDLE';
+                this.speed = SIMULATION_SPEEDS.SLOW; // Default to slow, graceful traversal
+
+                this.currentPath = [];
+                this.pathIndex = 0;
+                this.segmentProgress = 0;
+                this.splineProgress = 0;
+                this.replanningCount = 0;
+                this.totalDistanceTraveled = 0;
+                this.totalStepsTaken = 0;
+                this.accumulatedMovementCost = 0;
+                this.lastPlanningTimeMs = 0;
+                this.routeHistory = [];
+                this.isSingleStepping = false;
+                this.onReplanCallback = null;
+                this.pathMode = 'smooth';
+                this.smoothSpline = null;
+                this.splineLength = 0;
+                this.splineProgress = 0;
+            }
+
+            setPathMode(mode) {
+                this.pathMode = mode;
+                this.terrainView.pathMode = mode;
+                if (this.currentPath.length >= 2) {
+                    this.buildSpline();
+                    this.terrainView.renderPath(this.currentPath, [], this.algorithm);
+                }
+            }
+
+            buildSpline() {
+                if (!this.currentPath || this.currentPath.length < 2) {
+                    this.smoothSpline = null;
+                    this.splineLength = 0;
+                    return;
+                }
+                const pts = this.currentPath.map(n => {
+                    const wp = this.grid.gridToWorld(n.col, n.row);
+                    const groundY = this.grid.getExactElevation(wp.x, wp.z);
+                    return new THREE.Vector3(wp.x, groundY + 0.35, wp.z);
+                });
+                this.smoothSpline = new THREE.CatmullRomCurve3(pts, false, 'centripetal', 0.5);
+                this.splineLength = this.smoothSpline.getLength();
+            }
+
+            setState(s) {
+                this.state = s;
+                if (this.onStatusChange) this.onStatusChange(this.state);
+                this.pushMetrics();
+            }
+
+            setAlgorithm(alg) {
+                if (this.state === 'MOVING') this.pause();
+                this.algorithm = alg;
+                this.planPath();
+            }
+
+            setSpeed(k) { if (SIMULATION_SPEEDS[k]) this.speed = SIMULATION_SPEEDS[k]; }
+
+            setRouteOptimization(mode) {
+                this.routeOptimization = mode;
+                const activeRoute = (mode === 'shortest') ? this.shortestRoute : this.bestRoute;
+                if (activeRoute && activeRoute.success) {
+                    this.currentPath = activeRoute.path;
+                    this.pathIndex = 0;
+                    this.segmentProgress = 0;
+                    if (this.pathMode === 'smooth') {
+                        this.buildSpline();
+                        this.splineProgress = 0;
+                    }
+                    this.terrainView.renderDualComparativePaths(this.bestRoute.path, this.shortestRoute.path, this.routeOptimization);
+                    this.pushMetrics(activeRoute);
+                }
+            }
+
+            planPath(fromCurrentRover = false) {
+                this.setState('PLANNING');
+                const start = fromCurrentRover ? { col: this.rover.currentCol, row: this.rover.currentRow } : this.grid.start;
+
+                // 1. Calculate both Best (Fuel-Optimal) and Shortest (Distance) routes
+                this.bestRoute = findPathBest(this.grid, start, this.grid.destination, this.algorithm);
+                this.shortestRoute = findPathShortest(this.grid, start, this.grid.destination, this.algorithm);
+
+                // Calculate fuel savings
+                if (this.shortestRoute.success && this.bestRoute.success && this.shortestRoute.fuel > 0) {
+                    const diff = this.shortestRoute.fuel - this.bestRoute.fuel;
+                    this.fuelSavingsPercent = Math.max(0, parseFloat(((diff / this.shortestRoute.fuel) * 100).toFixed(1)));
+                } else {
+                    this.fuelSavingsPercent = 0;
+                }
+
+                const activeRes = (this.routeOptimization === 'shortest') ? this.shortestRoute : this.bestRoute;
+                this.lastPlanningTimeMs = activeRes.planningTimeMs;
+
+                if (activeRes.success) {
+                    this.currentPath = activeRes.path;
+                    this.pathIndex = 0;
+                    this.segmentProgress = 0;
+                    this.splineProgress = 0;
+                    if (!fromCurrentRover) {
+                        this.totalDistanceTraveled = 0;
+                        this.totalStepsTaken = 0;
+                        this.accumulatedMovementCost = 0;
+                        this.accumulatedFuelBurned = 0;
+                        this.totalElevGain = 0;
+                        this.routeHistory = [this.currentPath[0]];
+                        this.rover.resetToStart();
+                        if (this.currentPath.length >= 2) {
+                            const p0 = this.grid.gridToWorld(this.currentPath[0].col, this.currentPath[0].row);
+                            const p1 = this.grid.gridToWorld(this.currentPath[1].col, this.currentPath[1].row);
+                            this.rover.updatePosition(p0.x, p0.y, p0.z, { x: p1.x - p0.x, z: p1.z - p0.z });
+                        }
+                    }
+                    if (this.pathMode === 'smooth') {
+                        this.buildSpline();
+                    }
+                    this.terrainView.renderDualComparativePaths(this.bestRoute.path, this.shortestRoute.path, this.routeOptimization);
+                    this.setState('IDLE');
+                    this.pushMetrics(activeRes);
+                    if (this.backendClient && activeRes.path && activeRes.path.length > 0) {
+                        const worldWps = activeRes.path.map(c => this.grid.gridToWorld(c.col, c.row));
+                        this.backendClient.sendWaypoints(worldWps, this.algorithm, this.routeOptimization);
+                    }
+                    return true;
+                } else {
+                    this.currentPath = [];
+                    this.terrainView.clearPath();
+                    this.setState('FAILED');
+                    this.notify('Mission Failed: ' + activeRes.reason, 'error');
+                    this.pushMetrics(activeRes);
+                    return false;
+                }
+            }
+
+            start() {
+                if (this.state === 'COMPLETED' || this.state === 'FAILED') {
+                    this.replay();
+                    return;
+                }
+                if (this.currentPath.length === 0 || this.pathIndex >= this.currentPath.length - 1 || this.splineProgress >= 1.0) {
+                    if (!this.planPath(false)) return;
+                }
+                this.isSingleStepping = false;
+                this.setState('MOVING');
+                if (this.backendClient) {
+                    const sp = this.grid.gridToWorld(this.grid.start.col, this.grid.start.row);
+                    const dp = this.grid.gridToWorld(this.grid.destination.col, this.grid.destination.row);
+                    this.backendClient.sendMissionStart({
+                        start: sp,
+                        destination: dp,
+                        algorithm: this.algorithm,
+                        routeOptimization: this.routeOptimization,
+                        topography: this.grid.slopeProfile || 'ridges',
+                        terrainMode: this.grid.mode
+                    });
+                }
+                this.notify('Rover movement started (' + this.algorithm + ')', 'info');
+            }
+
+            pause() {
+                if (this.state === 'MOVING') {
+                    this.setState('PAUSED');
+                    this.notify('Rover movement paused', 'neutral');
+                }
+            }
+
+            resume() {
+                if (this.state === 'PAUSED') {
+                    this.isSingleStepping = false;
+                    this.setState('MOVING');
+                    this.notify('Rover movement resumed', 'info');
+                }
+            }
+
+            reset() {
+                this.setState('IDLE');
+                this.rover.resetToStart();
+                this.pathIndex = 0;
+                this.segmentProgress = 0;
+                this.splineProgress = 0;
+                this.replanningCount = 0;
+                this.totalDistanceTraveled = 0;
+                this.totalStepsTaken = 0;
+                this.accumulatedMovementCost = 0;
+                this.accumulatedFuelBurned = 0;
+                this.totalElevGain = 0;
+                this.isSingleStepping = false;
+                this.routeHistory = [];
+                if (this.backendClient) {
+                    this.backendClient.sendMissionReset();
+                }
+                this.planPath(false);
+            }
+
+            replay() {
+                this.rover.resetToStart();
+                this.splineProgress = 0;
+                this.segmentProgress = 0;
+                this.pathIndex = 0;
+                this.replanningCount = 0;
+                this.totalDistanceTraveled = 0;
+                this.totalStepsTaken = 0;
+                this.accumulatedMovementCost = 0;
+                this.accumulatedFuelBurned = 0;
+                this.totalElevGain = 0;
+                this.routeHistory = [];
+                this.isSingleStepping = false;
+
+                if (!this.currentPath || this.currentPath.length < 2) {
+                    if (!this.planPath(false)) return;
+                } else {
+                    const p0 = this.grid.gridToWorld(this.currentPath[0].col, this.currentPath[0].row);
+                    const p1 = this.grid.gridToWorld(this.currentPath[1].col, this.currentPath[1].row);
+                    this.rover.updatePosition(p0.x, p0.y, p0.z, { x: p1.x - p0.x, z: p1.z - p0.z });
+                    this.routeHistory = [this.currentPath[0]];
+
+                    if (this.pathMode === 'smooth') {
+                        this.buildSpline();
+                        this.splineProgress = 0;
+                    }
+
+                    if (this.bestRoute && this.shortestRoute) {
+                        this.terrainView.renderDualComparativePaths(this.bestRoute.path, this.shortestRoute.path, this.routeOptimization);
+                    } else {
+                        this.terrainView.renderPath(this.currentPath, [], this.algorithm);
+                    }
+                }
+
+                if (this.backendClient) {
+                    this.backendClient.sendMissionReset();
+                }
+
+                this.setState('MOVING');
+
+                if (this.backendClient) {
+                    const sp = this.grid.gridToWorld(this.grid.start.col, this.grid.start.row);
+                    const dp = this.grid.gridToWorld(this.grid.destination.col, this.grid.destination.row);
+                    this.backendClient.sendMissionStart({
+                        start: sp,
+                        destination: dp,
+                        algorithm: this.algorithm,
+                        routeOptimization: this.routeOptimization,
+                        topography: this.grid.slopeProfile || 'ridges',
+                        terrainMode: this.grid.mode
+                    });
+                }
+                this.notify('Replaying mission from start (' + this.algorithm + ')', 'info');
+            }
+
+            step() {
+                if (this.state === 'COMPLETED' || this.state === 'FAILED') return;
+                if (this.currentPath.length === 0 && !this.planPath(false)) return;
+                this.isSingleStepping = true;
+                this.setState('MOVING');
+            }
+
+            injectDynamicObstacle(col = null, row = null, type = CELL_TYPES.ROCK) {
+                if (col === null || row === null) {
+                    if (this.currentPath.length > 0 && this.pathIndex < this.currentPath.length - 2) {
+                        const tn = this.currentPath[Math.min(this.pathIndex + 2, this.currentPath.length - 2)];
+                        col = tn.col; row = tn.row;
+                    } else {
+                        col = Math.floor(this.grid.cols / 2);
+                        row = Math.floor(this.grid.rows / 2);
+                    }
+                }
+
+                if ((col === this.grid.start.col && row === this.grid.start.row) ||
+                    (col === this.grid.destination.col && row === this.grid.destination.row)) {
+                    this.notify('Cannot drop obstacle on Start/Dest', 'warning');
+                    return false;
+                }
+
+                if (col === this.rover.currentCol && row === this.rover.currentRow) {
+                    this.notify('Cannot drop obstacle on Rover', 'warning');
+                    return false;
+                }
+
+                this.grid.setCellType(col, row, type);
+                this.terrainView.createObstacleMesh(col, row, type);
+                this.notify('Dynamic obstacle at [' + col + ', ' + row + ']', 'warning');
+
+                if (this.isUpcomingPathBlocked()) {
+                    this.handleDynamicObstruction();
+                }
+                return true;
+            }
+
+            isUpcomingPathBlocked() {
+                if (!this.currentPath || this.currentPath.length === 0) return false;
+                for (let i = this.pathIndex; i < this.currentPath.length; i++) {
+                    const c = this.currentPath[i];
+                    if (!this.grid.isWalkable(c.col, c.row)) return true;
+                }
+                return false;
+            }
+
+            handleDynamicObstruction() {
+                const wasMoving = (this.state === 'MOVING');
+                this.setState('REPLANNING');
+                this.notify('Dynamic Obstacle Detected! Stopping...', 'alert');
+
+                setTimeout(() => {
+                    this.notify('Replanning Route in progress...', 'alert');
+                    this.replanningCount++;
+
+                    const replanStart = { col: this.rover.currentCol, row: this.rover.currentRow };
+                    const res = this.algorithm === 'A*'
+                        ? findPathAStar(this.grid, replanStart, this.grid.destination)
+                        : findPathDijkstra(this.grid, replanStart, this.grid.destination);
+
+                    this.lastPlanningTimeMs = res.planningTimeMs;
+
+                    if (res.success) {
+                        this.currentPath = res.path;
+                        this.pathIndex = 0;
+                        this.segmentProgress = 0;
+                        this.terrainView.renderPath(this.currentPath, res.exploredNodes, this.algorithm);
+                        if (this.backendClient && res.path && res.path.length > 0) {
+                            const worldWps = res.path.map(c => this.grid.gridToWorld(c.col, c.row));
+                            this.backendClient.sendReplanning(this.replanningCount, worldWps, 'Dynamic obstacle detected on route');
+                        }
+                        this.notify('New Path Calculated! Resuming...', 'success');
+
+
+                        setTimeout(() => {
+                            if (wasMoving) this.setState('MOVING');
+                            else this.setState('IDLE');
+                            this.pushMetrics();
+                        }, 800);
+                    } else {
+                        this.currentPath = [];
+                        this.terrainView.clearPath();
+                        this.setState('FAILED');
+                        this.notify('MISSION FAILED: No route available.', 'error');
+                        this.pushMetrics(res);
+                    }
+                }, 600);
+            }
+
+            update(dt) {
+                const isMoving = (this.state === 'MOVING');
+                this.rover.animate(dt, isMoving, this.speed);
+                if (this.backendClient && isMoving) {
+                    const curPos = this.rover.group.position;
+                    this.backendClient.sendTelemetryThrottled(
+                        { x: parseFloat(curPos.x.toFixed(2)), y: parseFloat(curPos.y.toFixed(2)), z: parseFloat(curPos.z.toFixed(2)) },
+                        { yaw: parseFloat(this.rover.currentYaw.toFixed(3)), pitch: parseFloat((this.rover.currentPitch||0).toFixed(3)), roll: parseFloat((this.rover.currentRoll||0).toFixed(3)) },
+                        { distance: parseFloat(this.totalDistanceTraveled.toFixed(1)), fuelConsumed: parseFloat(this.accumulatedFuelBurned.toFixed(1)), steps: this.totalStepsTaken }
+                    );
+                }
+
+
+                // Fog of War SLAM discovery around current rover position (Feature 2)
+                if (this.grid.fogOfWar) {
+                    const newlyFound = this.grid.revealAround(this.rover.currentCol, this.rover.currentRow, 4.5);
+                    if (newlyFound && newlyFound.length > 0) {
+                        this.terrainView.updateFogVisibility();
+                        if (isMoving && this.isUpcomingPathBlocked()) {
+                            this.notify('[LIDAR SLAM] Hidden obstacle detected on path! Replanning...', 'alert');
+                            this.handleDynamicObstruction();
+                            return;
+                        }
+                    }
+                }
+
+                if (!isMoving || this.currentPath.length < 2) return;
+
+                // Continuous Spline Motion (Feature 1)
+                if (this.pathMode === 'smooth' && this.smoothSpline && this.splineLength > 0.1) {
+                    if (this.splineProgress >= 1.0) {
+                        this.handleMissionSuccess();
+                        return;
+                    }
+
+                    const distDelta = this.speed * this.grid.cellSize * dt;
+                    const progressSpeed = distDelta / Math.max(0.01, this.splineLength);
+                    this.splineProgress = Math.min(1.0, this.splineProgress + progressSpeed);
+                    this.totalDistanceTraveled += distDelta;
+
+                    // Continuous fuel accumulation
+                    const curPos = this.rover.group.position;
+                    const norm = this.grid.getTerrainNormal(curPos.x, curPos.z);
+                    const fwdSlope = norm.slopeX * (-Math.sin(this.rover.currentYaw)) + norm.slopeZ * (-Math.cos(this.rover.currentYaw));
+                    let slopeRate = 1.0;
+                    if (fwdSlope > 0) slopeRate = 1.0 + 7.0 * fwdSlope + 15.0 * (fwdSlope * fwdSlope);
+                    else slopeRate = Math.max(0.25, 1.0 - 0.65 * Math.abs(fwdSlope));
+                    this.accumulatedFuelBurned += distDelta * slopeRate;
+
+                    const pos = this.smoothSpline.getPointAt(this.splineProgress);
+                    const tangent = this.smoothSpline.getTangentAt(this.splineProgress);
+                    this.rover.updatePosition(pos.x, pos.y, pos.z, { x: tangent.x, z: tangent.z });
+
+                    const curG = this.grid.worldToGrid(pos.x, pos.z);
+                    if (curG.col !== this.rover.currentCol || curG.row !== this.rover.currentRow) {
+                        this.rover.currentCol = curG.col;
+                        this.rover.currentRow = curG.row;
+                        this.routeHistory.push({ col: curG.col, row: curG.row });
+                        this.totalStepsTaken++;
+                        this.pushMetrics();
+                    }
+
+                    // Check lookahead obstacle collision
+                    const lookaheadU = Math.min(1.0, this.splineProgress + 0.04);
+                    const lookaheadPos = this.smoothSpline.getPointAt(lookaheadU);
+                    const lookaheadG = this.grid.worldToGrid(lookaheadPos.x, lookaheadPos.z);
+                    if (!this.grid.isWalkable(lookaheadG.col, lookaheadG.row)) {
+                        this.handleDynamicObstruction();
+                        return;
+                    }
+
+                    if (this.splineProgress >= 1.0) {
+                        this.handleMissionSuccess();
+                        return;
+                    }
+                } else {
+                    // Grid discrete segment motion
+                    if (this.pathIndex >= this.currentPath.length - 1) {
+                        this.handleMissionSuccess();
+                        return;
+                    }
+
+                    const cCell = this.currentPath[this.pathIndex];
+                    const nCell = this.currentPath[this.pathIndex + 1];
+
+                    if (!this.grid.isWalkable(nCell.col, nCell.row)) {
+                        this.handleDynamicObstruction();
+                        return;
+                    }
+
+                    const p1 = this.grid.gridToWorld(cCell.col, cCell.row);
+                    const p2 = this.grid.gridToWorld(nCell.col, nCell.row);
+                    const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y, p2.z - p1.z);
+                    this.segmentProgress += (this.speed * this.grid.cellSize * dt) / Math.max(0.01, segDist);
+
+                    if (this.segmentProgress >= 1.0) {
+                        this.segmentProgress = 0;
+                        this.pathIndex++;
+                        this.totalStepsTaken++;
+                        this.totalDistanceTraveled += segDist;
+                        this.accumulatedMovementCost += this.grid.getMovementCost(cCell.col, cCell.row, nCell.col, nCell.row);
+                        const stepFuel = calculateStepFuel(cCell.col, cCell.row, nCell.col, nCell.row, this.grid);
+                        this.accumulatedFuelBurned += stepFuel;
+                        if (p2.y > p1.y) this.totalElevGain += (p2.y - p1.y);
+
+                        this.rover.currentCol = nCell.col;
+                        this.rover.currentRow = nCell.row;
+                        this.routeHistory.push({ col: nCell.col, row: nCell.row });
+                        this.pushMetrics();
+
+                        if (this.isSingleStepping) {
+                            this.setState('PAUSED');
+                            this.isSingleStepping = false;
+                            return;
+                        }
+
+                        if (this.pathIndex >= this.currentPath.length - 1) {
+                            this.handleMissionSuccess();
+                            return;
+                        }
+                    }
+
+                    const cp1 = this.grid.gridToWorld(this.currentPath[this.pathIndex].col, this.currentPath[this.pathIndex].row);
+                    const cp2 = this.grid.gridToWorld(this.currentPath[this.pathIndex + 1].col, this.currentPath[this.pathIndex + 1].row);
+                    const curX = cp1.x + (cp2.x - cp1.x) * this.segmentProgress;
+                    const curZ = cp1.z + (cp2.z - cp1.z) * this.segmentProgress;
+                    const groundY = this.grid.getExactElevation(curX, curZ);
+                    this.rover.updatePosition(
+                        curX,
+                        groundY,
+                        curZ,
+                        { x: cp2.x - cp1.x, z: cp2.z - cp1.z }
+                    );
+                }
+            }
+
+            handleMissionSuccess() {
+                this.setState('COMPLETED');
+                const destWp = this.grid.gridToWorld(this.grid.destination.col, this.grid.destination.row);
+                this.rover.updatePosition(destWp.x, destWp.y, destWp.z);
+                this.notify('MISSION COMPLETED: Target reached!', 'success');
+                if (this.onStatusChange) this.onStatusChange('COMPLETED');
+            }
+
+            notify(msg, type = 'info') {
+                if (this.onNotification) this.onNotification({ message: msg, type });
+            }
+
+            pushMetrics(res = null) {
+                if (!this.onMetricsUpdate) return;
+                let estDist = 0, estCost = 0, estSteps = 0;
+                if (this.currentPath && this.currentPath.length > 0) {
+                    estSteps = Math.max(0, this.currentPath.length - 1);
+                    for (let i = 0; i < this.currentPath.length - 1; i++) {
+                        const a = this.currentPath[i], b = this.currentPath[i + 1];
+                        const wa = this.grid.gridToWorld(a.col, a.row), wb = this.grid.gridToWorld(b.col, b.row);
+                        estDist += Math.hypot(wb.x - wa.x, wb.y - wa.y, wb.z - wa.z);
+                        estCost += this.grid.getMovementCost(a.col, a.row, b.col, b.row);
+                    }
+                }
+
+                const activeRoute = (this.routeOptimization === 'shortest') ? this.shortestRoute : this.bestRoute;
+                const estFuel = (activeRoute && activeRoute.success) ? activeRoute.fuel : 0;
+                const estElevGain = (activeRoute && activeRoute.success) ? activeRoute.elevGain : 0;
+                const dispFuel = (this.state === 'COMPLETED' || this.state === 'MOVING') ? this.accumulatedFuelBurned : estFuel;
+                const dispElev = (this.state === 'COMPLETED' || this.state === 'MOVING') ? this.totalElevGain : estElevGain;
+
+                this.onMetricsUpdate({
+                    algorithm: this.algorithm,
+                    routeOptimization: this.routeOptimization,
+                    distance: parseFloat((this.state === 'COMPLETED' ? this.totalDistanceTraveled : estDist).toFixed(1)),
+                    fuel: parseFloat(dispFuel.toFixed(1)),
+                    fuelSavingsPercent: this.fuelSavingsPercent || 0,
+                    elevGain: parseFloat(dispElev.toFixed(1)),
+                    steps: this.state === 'COMPLETED' ? this.totalStepsTaken : estSteps,
+                    planningTimeMs: res ? res.planningTimeMs : this.lastPlanningTimeMs,
+                    movementCost: parseFloat((this.state === 'COMPLETED' ? this.accumulatedMovementCost : estCost).toFixed(1)),
+                    replanningCount: this.replanningCount,
+                    missionStatus: this.state,
+                    nodesExplored: res ? res.nodesExplored : 0,
+                    roverPosition: { col: this.rover.currentCol, row: this.rover.currentRow },
+                    bestStats: this.bestRoute && this.bestRoute.success ? { distance: this.bestRoute.distance, fuel: this.bestRoute.fuel } : null,
+                    shortestStats: this.shortestRoute && this.shortestRoute.success ? { distance: this.shortestRoute.distance, fuel: this.shortestRoute.fuel } : null
+                });
+            }
+        }
+
+        /* 8. BUILT-IN ORBIT CONTROLS (Zero CDN Dependency) */
+        class BuiltinOrbitControls {
+            constructor(camera, domElement) {
+                this.camera = camera;
+                this.domElement = domElement || document;
+                this.enabled = true;
+                this.enableDamping = true;
+                this.dampingFactor = 0.06;
+                this.target = new THREE.Vector3(0, 0, 0);
+                this.minDistance = 10;
+                this.maxDistance = 150;
+                this.minPolarAngle = 0.05;
+                this.maxPolarAngle = Math.PI / 2 - 0.04;
+
+                this.isPointerDown = false;
+                this.pointerType = null;
+                this.prevPointerPos = { x: 0, y: 0 };
+                this.spherical = new THREE.Spherical();
+                this.targetSpherical = new THREE.Spherical();
+
+                this.syncFromCamera();
+                this.bindEvents();
+            }
+
+            syncFromCamera() {
+                const offset = new THREE.Vector3().copy(this.camera.position).sub(this.target);
+                this.spherical.setFromVector3(offset);
+                this.targetSpherical.copy(this.spherical);
+            }
+
+            bindEvents() {
+                const dom = this.domElement;
+                dom.addEventListener('contextmenu', (e) => e.preventDefault());
+
+                dom.addEventListener('pointerdown', (e) => {
+                    if (!this.enabled) return;
+                    this.isPointerDown = true;
+                    this.pointerType = (e.button === 2 || (e.button === 0 && !e.shiftKey)) ? 'rotate' : 'pan';
+                    this.prevPointerPos = { x: e.clientX, y: e.clientY };
+                });
+
+                window.addEventListener('pointermove', (e) => {
+                    if (!this.enabled || !this.isPointerDown) return;
+                    const dx = e.clientX - this.prevPointerPos.x;
+                    const dy = e.clientY - this.prevPointerPos.y;
+                    this.prevPointerPos = { x: e.clientX, y: e.clientY };
+
+                    if (this.pointerType === 'rotate') {
+                        this.targetSpherical.theta -= dx * 0.006;
+                        this.targetSpherical.phi -= dy * 0.006;
+                        this.targetSpherical.phi = Math.max(this.minPolarAngle, Math.min(this.maxPolarAngle, this.targetSpherical.phi));
+                    } else if (this.pointerType === 'pan') {
+                        const panSpeed = this.targetSpherical.radius * 0.0015;
+                        const right = new THREE.Vector3().crossVectors(this.camera.up, new THREE.Vector3().subVectors(this.camera.position, this.target)).normalize();
+                        this.target.addScaledVector(right, -dx * panSpeed);
+                        this.target.y += dy * panSpeed;
+                    }
+                });
+
+                window.addEventListener('pointerup', () => { this.isPointerDown = false; });
+
+                dom.addEventListener('wheel', (e) => {
+                    if (!this.enabled) return;
+                    e.preventDefault();
+                    const zoom = e.deltaY > 0 ? 1.08 : 0.92;
+                    this.targetSpherical.radius = Math.max(this.minDistance, Math.min(this.maxDistance, this.targetSpherical.radius * zoom));
+                }, { passive: false });
+            }
+
+            update() {
+                if (!this.enabled) return;
+                if (this.enableDamping) {
+                    this.spherical.theta += (this.targetSpherical.theta - this.spherical.theta) * this.dampingFactor;
+                    this.spherical.phi += (this.targetSpherical.phi - this.spherical.phi) * this.dampingFactor;
+                    this.spherical.radius += (this.targetSpherical.radius - this.spherical.radius) * this.dampingFactor;
+                } else {
+                    this.spherical.copy(this.targetSpherical);
+                }
+                const offset = new THREE.Vector3().setFromSpherical(this.spherical);
+                this.camera.position.copy(this.target).add(offset);
+                this.camera.lookAt(this.target);
+            }
+        }
+
+        /* 9. UI CONTROLLER */
+        class UIController {
+            constructor(scene, camera, renderer, controls, grid, terrainView, rover, simulation) {
+                this.scene = scene;
+                this.camera = camera;
+                this.renderer = renderer;
+                this.controls = controls;
+                this.grid = grid;
+                this.terrainView = terrainView;
+                this.rover = rover;
+                this.simulation = simulation;
+
+                this.raycaster = new THREE.Raycaster();
+                this.mouse = new THREE.Vector2();
+
+                this.activeTool = 'navigate';
+                this.selectedObstacleType = CELL_TYPES.ROCK;
+                this.selectedRestrictedMode = 'high_cost';
+
+                this.draggingMarker = null;
+                this.isPointerDown = false;
+                this.pointerDownPos = new THREE.Vector2();
+
+                this.cameraTargetPos = null;
+                this.cameraTargetLook = null;
+                this.activeCamMode = 'isometric';
+                this.hasShownSummaryForCurrentRun = false;
+
+                this.initDOMElements();
+                this.bindEvents();
+                this.setupPointerInteractions();
+            }
+
+            initDOMElements() {
+                this.dom = {
+                    metricAlg: document.getElementById('metric-algorithm'),
+                    metricFuel: document.getElementById('metric-fuel'),
+                    metricSavings: document.getElementById('metric-savings'),
+                    metricDistance: document.getElementById('metric-distance'),
+                    metricElevGain: document.getElementById('metric-elev-gain'),
+                    metricSteps: document.getElementById('metric-steps'),
+                    metricTime: document.getElementById('metric-time'),
+                    metricCost: document.getElementById('metric-cost'),
+                    metricReplans: document.getElementById('metric-replans'),
+                    metricStatus: document.getElementById('metric-status'),
+                    cardBestStats: document.getElementById('card-best-stats'),
+                    cardShortestStats: document.getElementById('card-shortest-stats'),
+                    cardSavingsText: document.getElementById('card-savings-text'),
+                    selectSlopeProfile: document.getElementById('select-slope-profile'),
+                    statusBadge: document.getElementById('status-badge'),
+                    notificationBanner: document.getElementById('notification-banner'),
+                    notificationText: document.getElementById('notification-text'),
+
+                    btnPlan: document.getElementById('btn-plan'),
+                    btnStart: document.getElementById('btn-start'),
+                    btnPause: document.getElementById('btn-pause'),
+                    btnResume: document.getElementById('btn-resume'),
+                    btnReset: document.getElementById('btn-reset'),
+                    btnStep: document.getElementById('btn-step'),
+                    btnDropDynamic: document.getElementById('btn-drop-dynamic'),
+                    btnCompare: document.getElementById('btn-compare'),
+
+                    compareModal: document.getElementById('compare-modal'),
+                    btnCompareClose: document.getElementById('btn-compare-close'),
+                    summaryModal: document.getElementById('summary-modal'),
+                    btnSummaryClose: document.getElementById('btn-summary-close'),
+                    btnSummaryReplay: document.getElementById('btn-summary-replay'),
+                    summaryContent: document.getElementById('summary-content'),
+                    compareContent: document.getElementById('compare-content'),
+
+                    toolBtns: document.querySelectorAll('[data-tool]'),
+                    terrainBtns: document.querySelectorAll('[data-terrain]'),
+                    presetBtns: document.querySelectorAll('[data-preset]'),
+                    algBtns: document.querySelectorAll('[data-alg]'),
+                    pathModeBtns: document.querySelectorAll('[data-pathmode]'),
+                    lidarBtns: document.querySelectorAll('[data-lidar]'),
+                    btnToggleFog: document.getElementById('btn-toggle-fog'),
+                    fogStatusText: document.getElementById('fog-status-text'),
+                    lidarStatus: document.getElementById('lidar-sensor-status'),
+                    speedBtns: document.querySelectorAll('[data-speed]'),
+                    camBtns: document.querySelectorAll('[data-cam]'),
+                    restrictedBtns: document.querySelectorAll('[data-restricted]'),
+                    obstacleTypeSelect: document.getElementById('select-obstacle-type')
+                };
+            }
+
+            bindEvents() {
+                this.dom.terrainBtns.forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        this.dom.terrainBtns.forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                        const mode = btn.dataset.terrain;
+                        this.grid.setTerrainMode(mode);
+                        this.terrainView.buildTerrainMesh();
+                        this.terrainView.updateMarkerPositions();
+                        this.terrainView.syncObstacles();
+                        this.rover.resetToStart();
+                        this.hasShownSummaryForCurrentRun = false;
+                        
+                this.simulation.planPath(false);
+                        this.showToast('Switched to ' + (mode === 'flat' ? 'Flat Grid' : 'Uneven Terrain'), 'info');
+                    });
+                });
+
+                this.dom.presetBtns.forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        this.dom.presetBtns.forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                        const preset = btn.dataset.preset;
+                        this.grid.applyPreset(preset);
+                        this.terrainView.buildTerrainMesh();
+                        this.terrainView.updateMarkerPositions();
+                        this.terrainView.syncObstacles();
+                        this.rover.resetToStart();
+                        this.hasShownSummaryForCurrentRun = false;
+                        this.simulation.reset();
+                        this.showToast('Loaded ' + preset.toUpperCase() + ' preset', 'info');
+                    });
+                });
+
+                this.dom.algBtns.forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        this.dom.algBtns.forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                        const alg = btn.dataset.alg;
+                        this.simulation.setAlgorithm(alg);
+                        this.showToast('Selected ' + alg + ' algorithm', 'info');
+                    });
+                });
+
+                this.dom.pathModeBtns.forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        this.dom.pathModeBtns.forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                        const mode = btn.dataset.pathmode;
+                        this.simulation.setPathMode(mode);
+                        this.showToast('Trajectory mode: ' + (mode === 'smooth' ? 'Smoothed Spline' : 'Grid Discrete'), 'info');
+                    });
+                });
+
+                this.dom.lidarBtns.forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        this.dom.lidarBtns.forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                        const isOn = (btn.dataset.lidar === 'on');
+                        this.rover.setLidarVisible(isOn);
+                        if (this.dom.lidarStatus) {
+                            this.dom.lidarStatus.textContent = isOn ? 'SCANNING' : 'OFF';
+                            this.dom.lidarStatus.style.color = isOn ? 'var(--accent-emerald)' : 'var(--text-muted)';
+                        }
+                        this.showToast('LIDAR sensor ' + (isOn ? 'active' : 'disabled'), 'info');
+                    });
+                });
+
+                if (this.dom.btnToggleFog) {
+                    this.dom.btnToggleFog.addEventListener('click', () => {
+                        this.grid.fogOfWar = !this.grid.fogOfWar;
+                        const active = this.grid.fogOfWar;
+                        this.dom.btnToggleFog.classList.toggle('active', active);
+                        if (this.dom.fogStatusText) {
+                            this.dom.fogStatusText.textContent = active ? 'ON' : 'OFF';
+                            this.dom.fogStatusText.style.color = active ? 'var(--accent-emerald)' : 'var(--text-muted)';
+                        }
+                        if (active) {
+                            this.grid.discoveredCells.clear();
+                            this.grid.revealAround(this.grid.start.col, this.grid.start.row, 3.5);
+                            this.grid.revealAround(this.grid.destination.col, this.grid.destination.row, 2.0);
+                            this.grid.revealAround(this.rover.currentCol, this.rover.currentRow, 4.5);
+                        }
+                        this.terrainView.updateFogVisibility();
+                        this.showToast('Fog of War SLAM Discovery ' + (active ? 'Enabled' : 'Disabled'), active ? 'success' : 'neutral');
+                    });
+                }
+
+                this.dom.speedBtns.forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        this.dom.speedBtns.forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                        this.simulation.setSpeed(btn.dataset.speed);
+                    });
+                });
+
+                this.dom.camBtns.forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        this.dom.camBtns.forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                        this.transitionCamera(btn.dataset.cam);
+                    });
+                });
+
+                this.dom.toolBtns.forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        this.dom.toolBtns.forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                        this.activeTool = btn.dataset.tool;
+                        this.controls.enabled = (this.activeTool === 'navigate');
+                        this.updateCursor();
+                    });
+                });
+
+                if (this.dom.obstacleTypeSelect) {
+                    this.dom.obstacleTypeSelect.addEventListener('change', (e) => {
+                        this.selectedObstacleType = e.target.value;
+                    });
+                }
+
+                this.dom.restrictedBtns.forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        this.dom.restrictedBtns.forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                        this.selectedRestrictedMode = btn.dataset.restricted;
+                        this.grid.restrictedMode = this.selectedRestrictedMode;
+                    });
+                });
+
+                this.dom.btnPlan.addEventListener('click', () => {
+                    this.hasShownSummaryForCurrentRun = false;
+                                    this.simulation.planPath(false);
+                    this.showToast('Route calculated', 'success');
+                });
+
+                this.dom.btnStart.addEventListener('click', () => {
+                    this.hasShownSummaryForCurrentRun = false;
+                    this.simulation.start();
+                });
+
+                this.dom.btnPause.addEventListener('click', () => this.simulation.pause());
+                this.dom.btnResume.addEventListener('click', () => this.simulation.resume());
+
+                this.dom.btnReset.addEventListener('click', () => {
+                    this.hasShownSummaryForCurrentRun = false;
+                    this.simulation.reset();
+                    this.showToast('Reset to start', 'neutral');
+                });
+
+                this.dom.btnStep.addEventListener('click', () => this.simulation.step());
+
+                this.dom.btnDropDynamic.addEventListener('click', () => {
+                    this.simulation.injectDynamicObstacle(null, null, this.selectedObstacleType);
+                });
+
+                const btnRandom = document.getElementById('btn-random-obstacles');
+                if (btnRandom) {
+                    btnRandom.addEventListener('click', () => {
+                        this.grid.generateRandomObstacles(25);
+                        this.terrainView.syncObstacles();
+                                        this.simulation.planPath(false);
+                        this.showToast('Generated random obstacles', 'info');
+                    });
+                }
+
+                const btnClear = document.getElementById('btn-clear-obstacles');
+                if (btnClear) {
+                    btnClear.addEventListener('click', () => {
+                        this.grid.clearAllObstacles();
+                        this.terrainView.syncObstacles();
+                                        this.simulation.planPath(false);
+                        this.showToast('Cleared obstacles', 'info');
+                    });
+                }
+
+                this.dom.btnCompare.addEventListener('click', () => this.openAlgorithmComparison());
+                this.dom.btnCompareClose.addEventListener('click', () => {
+                    this.dom.compareModal.classList.remove('open');
+                    if (this.simulation.currentPath.length > 0) {
+                        this.terrainView.renderPath(this.simulation.currentPath, [], this.simulation.algorithm);
+                    }
+                });
+
+                this.dom.btnSummaryClose.addEventListener('click', () => {
+                    this.dom.summaryModal.classList.remove('open');
+                });
+
+                                // Collapsible section headers for Left Menu Bar
+                document.querySelectorAll('.section-header').forEach(header => {
+                    header.addEventListener('click', () => {
+                        const section = header.closest('.panel-section');
+                        if (section) section.classList.toggle('collapsed');
+                    });
+                });
+
+                this.dom.btnSummaryReplay.addEventListener('click', () => {
+                    this.dom.summaryModal.classList.remove('open');
+                    this.hasShownSummaryForCurrentRun = false;
+                    this.simulation.replay();
+                });
+            }
+
+            updateCursor() {
+                const canvas = this.renderer.domElement;
+                if (this.activeTool === 'start' || this.activeTool === 'destination') canvas.style.cursor = 'pointer';
+                else if (this.activeTool === 'obstacle' || this.activeTool === 'restricted' || this.activeTool === 'dynamic') canvas.style.cursor = 'crosshair';
+                else if (this.activeTool === 'remove') canvas.style.cursor = 'not-allowed';
+                else canvas.style.cursor = 'grab';
+            }
+
+            setupPointerInteractions() {
+                const canvas = this.renderer.domElement;
+                canvas.addEventListener('pointerdown', (e) => {
+                    this.isPointerDown = true;
+                    this.pointerDownPos.set(e.clientX, e.clientY);
+                    this.updateMouseCoords(e);
+                    this.raycaster.setFromCamera(this.mouse, this.camera);
+
+                    if (this.activeTool === 'navigate' || this.activeTool === 'start' || this.activeTool === 'destination') {
+                        const markerHits = this.raycaster.intersectObjects([this.terrainView.startMarker, this.terrainView.destinationMarker], true);
+                        if (markerHits.length > 0) {
+                            let hitObj = markerHits[0].object;
+                            while (hitObj.parent && hitObj.name !== 'StartMarker' && hitObj.name !== 'DestinationMarker') {
+                                hitObj = hitObj.parent;
+                            }
+                            if (hitObj.name === 'StartMarker') {
+                                this.draggingMarker = 'start';
+                                this.controls.enabled = false;
+                                canvas.style.cursor = 'grabbing';
+                                return;
+                            } else if (hitObj.name === 'DestinationMarker') {
+                                this.draggingMarker = 'destination';
+                                this.controls.enabled = false;
+                                canvas.style.cursor = 'grabbing';
+                                return;
+                            }
+                        }
+                    }
+                });
+
+                canvas.addEventListener('pointermove', (e) => {
+                    this.updateMouseCoords(e);
+                    if (this.draggingMarker) {
+                        this.raycaster.setFromCamera(this.mouse, this.camera);
+                        const groundHits = this.raycaster.intersectObject(this.terrainView.groundMesh);
+                        if (groundHits.length > 0) {
+                            const hitPoint = groundHits[0].point;
+                            const gridCoord = this.grid.worldToGrid(hitPoint.x, hitPoint.z);
+                            if (this.draggingMarker === 'start') {
+                                if (this.grid.isWalkable(gridCoord.col, gridCoord.row)) {
+                                    this.grid.setStart(gridCoord.col, gridCoord.row);
+                                    this.terrainView.updateMarkerPositions();
+                                    this.rover.resetToStart();
+                                }
+                            } else if (this.draggingMarker === 'destination') {
+                                if (this.grid.isWalkable(gridCoord.col, gridCoord.row)) {
+                                    this.grid.setDestination(gridCoord.col, gridCoord.row);
+                                    this.terrainView.updateMarkerPositions();
+                                }
+                            }
+                        }
+                    }
+                });
+
+                canvas.addEventListener('pointerup', (e) => {
+                    const dragDist = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y);
+                    if (this.draggingMarker) {
+                        this.draggingMarker = null;
+                        this.controls.enabled = (this.activeTool === 'navigate');
+                        this.updateCursor();
+                                        this.simulation.planPath(false);
+                        this.showToast('Marker repositioned', 'info');
+                        this.isPointerDown = false;
+                        return;
+                    }
+                    this.isPointerDown = false;
+                    if (dragDist < 6) this.handleTerrainClick(e);
+                });
+            }
+
+            updateMouseCoords(e) {
+                const rect = this.renderer.domElement.getBoundingClientRect();
+                this.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+                this.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            }
+
+            handleTerrainClick(e) {
+                this.raycaster.setFromCamera(this.mouse, this.camera);
+                const hits = this.raycaster.intersectObject(this.terrainView.groundMesh);
+                if (hits.length === 0) return;
+                const { col, row } = this.grid.worldToGrid(hits[0].point.x, hits[0].point.z);
+
+                switch (this.activeTool) {
+                    case 'start': {
+                        if (!this.grid.isWalkable(col, row)) {
+                            this.showToast('Cannot set Start on obstacle', 'warning');
+                            return;
+                        }
+                        if (this.grid.setStart(col, row)) {
+                            this.terrainView.updateMarkerPositions();
+                            this.rover.resetToStart();
+                                            this.simulation.planPath(false);
+                        }
+                        break;
+                    }
+                    case 'destination': {
+                        if (!this.grid.isWalkable(col, row)) {
+                            this.showToast('Cannot set Destination on obstacle', 'warning');
+                            return;
+                        }
+                        if (this.grid.setDestination(col, row)) {
+                            this.terrainView.updateMarkerPositions();
+                                            this.simulation.planPath(false);
+                        }
+                        break;
+                    }
+                    case 'obstacle': {
+                        if ((col === this.grid.start.col && row === this.grid.start.row) ||
+                            (col === this.grid.destination.col && row === this.grid.destination.row)) {
+                            this.showToast('Cannot place obstacle on Start/Destination', 'warning');
+                            return;
+                        }
+                        this.grid.setCellType(col, row, this.selectedObstacleType);
+                        this.terrainView.createObstacleMesh(col, row, this.selectedObstacleType);
+                        if (this.simulation.state === 'MOVING') {
+                            if (this.simulation.isUpcomingPathBlocked()) this.simulation.handleDynamicObstruction();
+                        } else {
+                                            this.simulation.planPath(false);
+                        }
+                        break;
+                    }
+                    case 'restricted': {
+                        const restType = (this.selectedRestrictedMode === 'blocked') ? CELL_TYPES.RESTRICTED_BLOCKED : CELL_TYPES.RESTRICTED_HIGH_COST;
+                        this.grid.setCellType(col, row, restType);
+                        this.terrainView.createObstacleMesh(col, row, restType);
+                                        this.simulation.planPath(false);
+                        break;
+                    }
+                    case 'remove': {
+                        this.grid.clearCell(col, row);
+                        this.terrainView.removeObstacleMesh(col, row);
+                                        this.simulation.planPath(false);
+                        break;
+                    }
+                    case 'dynamic': {
+                        this.simulation.injectDynamicObstacle(col, row, this.selectedObstacleType);
+                        break;
+                    }
+                }
+            }
+
+            transitionCamera(viewKey) {
+                const key = viewKey.toLowerCase();
+                if (key === 'chase' || key === 'cockpit') {
+                    this.activeCamMode = key;
+                    this.cameraTargetPos = null;
+                    this.cameraTargetLook = null;
+                    this.showToast('Camera tracking: ' + (key === 'chase' ? 'Rover Chase Cam' : 'Driver Cockpit POV'), 'info');
+                    return;
+                }
+                this.activeCamMode = 'fixed';
+                const view = CAMERA_VIEWS[viewKey.toUpperCase()];
+                if (!view) return;
+                this.cameraTargetPos = new THREE.Vector3(...view.pos);
+                this.cameraTargetLook = new THREE.Vector3(...view.target);
+            }
+
+            updateCameraTransition() {
+                if (this.activeCamMode === 'chase' || this.activeCamMode === 'cockpit') {
+                    const roverPos = this.rover.group.position;
+                    const roverYaw = this.rover.currentYaw;
+                    const roverPitch = this.rover.currentPitch || 0;
+
+                    if (this.activeCamMode === 'chase') {
+                        // Dynamic Third-Person Follow Camera
+                        const dist = 6.2;
+                        const height = 3.2;
+                        const camX = roverPos.x + Math.sin(roverYaw) * dist;
+                        const camY = roverPos.y + height - Math.sin(roverPitch) * 1.5;
+                        const camZ = roverPos.z + Math.cos(roverYaw) * dist;
+
+                        const tarX = roverPos.x - Math.sin(roverYaw) * 4.0;
+                        const tarY = roverPos.y + 0.9 + Math.sin(roverPitch) * 2.0;
+                        const tarZ = roverPos.z - Math.cos(roverYaw) * 4.0;
+
+                        this.camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.12);
+                        this.controls.target.lerp(new THREE.Vector3(tarX, tarY, tarZ), 0.15);
+                        this.camera.lookAt(this.controls.target);
+                    } else if (this.activeCamMode === 'cockpit') {
+                        // First-Person Driver / Mast POV
+                        const camX = roverPos.x - Math.sin(roverYaw) * 0.25;
+                        const camY = roverPos.y + 1.25;
+                        const camZ = roverPos.z - Math.cos(roverYaw) * 0.25;
+
+                        const tarX = roverPos.x - Math.sin(roverYaw) * 10.0;
+                        const tarY = roverPos.y + 1.1 + Math.sin(roverPitch) * 4.0;
+                        const tarZ = roverPos.z - Math.cos(roverYaw) * 10.0;
+
+                        this.camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.28);
+                        this.controls.target.lerp(new THREE.Vector3(tarX, tarY, tarZ), 0.28);
+                        this.camera.lookAt(this.controls.target);
+                    }
+                    this.controls.update();
+                    return;
+                }
+
+                // Fixed Overview Camera Transition
+                if (!this.cameraTargetPos) return;
+                this.camera.position.lerp(this.cameraTargetPos, 0.08);
+                this.controls.target.lerp(this.cameraTargetLook, 0.08);
+                if (this.camera.position.distanceTo(this.cameraTargetPos) < 0.2) {
+                    this.camera.position.copy(this.cameraTargetPos);
+                    this.controls.target.copy(this.cameraTargetLook);
+                    this.cameraTargetPos = null;
+                    this.cameraTargetLook = null;
+                }
+                this.controls.update();
+            }
+
+            updateMetrics(metrics) {
+                if (!this.dom.metricAlg) return;
+                this.dom.metricAlg.textContent = metrics.algorithm;
+                if (this.dom.metricFuel) this.dom.metricFuel.textContent = metrics.fuel + ' L';
+                if (this.dom.metricSavings) {
+                    this.dom.metricSavings.textContent = metrics.fuelSavingsPercent > 0 ? (metrics.fuelSavingsPercent + '% Saved') : '0.0%';
+                }
+                if (this.dom.metricElevGain) this.dom.metricElevGain.textContent = '+' + metrics.elevGain + ' m';
+                this.dom.metricDistance.textContent = metrics.distance + ' m';
+                this.dom.metricSteps.textContent = metrics.steps;
+                this.dom.metricTime.textContent = (metrics.planningTimeMs / 1000).toFixed(3) + ' s';
+                if (this.dom.metricCost) this.dom.metricCost.textContent = metrics.movementCost;
+                this.dom.metricReplans.textContent = metrics.replanningCount;
+                this.dom.metricStatus.textContent = metrics.missionStatus;
+
+                // Update Route Comparison Mini-Card
+                if (this.dom.cardBestStats && metrics.bestStats) {
+                    this.dom.cardBestStats.textContent = metrics.bestStats.distance + ' m | ' + metrics.bestStats.fuel + ' L';
+                }
+                if (this.dom.cardShortestStats && metrics.shortestStats) {
+                    this.dom.cardShortestStats.textContent = metrics.shortestStats.distance + ' m | ' + metrics.shortestStats.fuel + ' L';
+                }
+                this.lastMetrics = metrics;
+                if (this.dom.cardSavingsText) {
+                    if (metrics.missionStatus === 'COMPLETED') {
+                        this.dom.cardSavingsText.innerHTML = '<span style="color: var(--accent-emerald); font-weight: 700;">✓ Destination Reached!</span>' +
+                            '<div style="display:flex; gap:6px; margin-top:5px;">' +
+                            '  <button id="btn-card-replay" style="flex:1; padding:4px 6px; background: rgba(16,185,129,0.25); border: 1px solid var(--accent-emerald); border-radius: 4px; color: var(--accent-emerald); font-weight:700; font-size:10.5px; cursor:pointer;">🔄 Replay</button>' +
+                            '  <button id="btn-reopen-summary" style="flex:1.2; padding:4px 6px; background: rgba(6,182,212,0.25); border: 1px solid var(--accent-cyan); border-radius: 4px; color: var(--accent-cyan); font-weight:700; font-size:10.5px; cursor:pointer;">📋 Summary</button>' +
+                            '</div>';
+                        const btnCardReplay = document.getElementById('btn-card-replay');
+                        if (btnCardReplay) {
+                            btnCardReplay.onclick = () => {
+                                this.hasShownSummaryForCurrentRun = false;
+                                this.simulation.replay();
+                            };
+                        }
+                        const btnReopen = document.getElementById('btn-reopen-summary');
+                        if (btnReopen) {
+                            btnReopen.onclick = () => this.showMissionSummary(this.lastMetrics || metrics);
+                        }
+                    } else if (metrics.fuelSavingsPercent > 0) {
+                        this.dom.cardSavingsText.textContent = '⚡ Best route saves ' + metrics.fuelSavingsPercent + '% Fuel!';
+                        this.dom.cardSavingsText.style.color = 'var(--accent-emerald)';
+                    } else {
+                        this.dom.cardSavingsText.textContent = 'Routes have equal fuel consumption';
+                        this.dom.cardSavingsText.style.color = 'var(--text-secondary)';
+                    }
+                }
+
+                if (this.dom.statusBadge) {
+                    this.dom.statusBadge.className = 'status-badge ' + metrics.missionStatus.toLowerCase();
+                    this.dom.statusBadge.textContent = metrics.missionStatus;
+                }
+
+                if ((metrics.missionStatus === 'COMPLETED' || metrics.missionStatus === 'FAILED') && !this.hasShownSummaryForCurrentRun) {
+                    this.hasShownSummaryForCurrentRun = true;
+                    this.showMissionSummary(metrics);
+                }
+            }
+
+            showToast(message, type = 'info') {
+                const banner = this.dom.notificationBanner;
+                const text = this.dom.notificationText;
+                if (!banner || !text) return;
+                text.textContent = message;
+                banner.className = 'notification-banner show ' + type;
+                clearTimeout(this.toastTimeout);
+                this.toastTimeout = setTimeout(() => { banner.classList.remove('show'); }, 3200);
+            }
+
+            openAlgorithmComparison() {
+                const results = runAlgorithmComparison(this.grid);
+                this.terrainView.renderDualPaths(results.aStar.path, results.dijkstra.path);
+                const a = results.aStar, d = results.dijkstra;
+
+                this.dom.compareContent.innerHTML = `
+                    <div class="comparison-grid">
+                        <div class="comparison-column a-star">
+                            <div class="alg-header"><span class="color-dot cyan"></span><h3>A* Algorithm</h3><span class="badge">Heuristic</span></div>
+                            <div class="metric-row"><span>Status:</span> <strong>` + (a.success ? 'Found' : 'Failed') + `</strong></div>
+                            <div class="metric-row"><span>Distance:</span> <strong>` + a.distance + ` m</strong></div>
+                            <div class="metric-row"><span>Steps:</span> <strong>` + a.steps + `</strong></div>
+                            <div class="metric-row"><span>Cost:</span> <strong>` + a.cost + `</strong></div>
+                            <div class="metric-row"><span>Time:</span> <strong>` + a.planningTimeMs + ` ms</strong></div>
+                            <div class="metric-row"><span>Explored:</span> <strong>` + a.nodesExplored + `</strong></div>
+                        </div>
+                        <div class="comparison-column dijkstra">
+                            <div class="alg-header"><span class="color-dot magenta"></span><h3>Dijkstra Algorithm</h3><span class="badge">Uniform-Cost</span></div>
+                            <div class="metric-row"><span>Status:</span> <strong>` + (d.success ? 'Found' : 'Failed') + `</strong></div>
+                            <div class="metric-row"><span>Distance:</span> <strong>` + d.distance + ` m</strong></div>
+                            <div class="metric-row"><span>Steps:</span> <strong>` + d.steps + `</strong></div>
+                            <div class="metric-row"><span>Cost:</span> <strong>` + d.cost + `</strong></div>
+                            <div class="metric-row"><span>Time:</span> <strong>` + d.planningTimeMs + ` ms</strong></div>
+                            <div class="metric-row"><span>Explored:</span> <strong>` + d.nodesExplored + `</strong></div>
+                        </div>
+                    </div>
+                    <div class="comparison-note">
+                        <p><strong>Analysis:</strong> Both routes are rendered in 3D (<span style="color: #06b6d4;">Cyan: A*</span>, <span style="color: #a855f7;">Magenta: Dijkstra</span>). A* uses admissible heuristics to focus search frontiers, while Dijkstra expands equally in all directions.</p>
+                    </div>
+                `;
+                this.dom.compareModal.classList.add('open');
+            }
+
+            showMissionSummary(metrics) {
+                const isSuccess = (metrics.missionStatus === 'COMPLETED');
+                const routeCoords = this.simulation.routeHistory.map(c => '[' + c.col + ',' + c.row + ']').join(' → ') || 'N/A';
+
+                let obstacleCount = 0;
+                for (let r = 0; r < this.grid.rows; r++) {
+                    for (let c = 0; c < this.grid.cols; c++) {
+                        if (this.grid.getCell(c, r).type !== CELL_TYPES.EMPTY) obstacleCount++;
+                    }
+                }
+
+                this.dom.summaryContent.innerHTML = `
+                    <div class="summary-status-header ` + (isSuccess ? 'success' : 'failed') + `">
+                        <div class="status-icon">` + (isSuccess ? '✓' : '✗') + `</div>
+                        <h2>` + (isSuccess ? 'MISSION COMPLETED' : 'MISSION FAILED') + `</h2>
+                        <p>` + (isSuccess ? 'Rover autonomously traversed the terrain to the target coordinates.' : 'No valid traversal route available.') + `</p>
+                    </div>
+                    <div class="summary-stats-grid">
+                        <div class="stat-card"><span class="label">Algorithm</span><span class="val">` + metrics.algorithm + `</span></div>
+                        <div class="stat-card"><span class="label">Route Type</span><span class="val">` + (metrics.routeOptimization === 'shortest' ? 'Shortest (Dist)' : 'Best (Fuel)') + `</span></div>
+                        <div class="stat-card"><span class="label">Fuel Consumed</span><span class="val" style="color: var(--accent-emerald);">` + metrics.fuel + ` L</span></div>
+                        <div class="stat-card"><span class="label">Fuel Savings</span><span class="val" style="color: var(--accent-cyan);">` + metrics.fuelSavingsPercent + `%</span></div>
+                        <div class="stat-card"><span class="label">Distance</span><span class="val">` + metrics.distance + ` m</span></div>
+                        <div class="stat-card"><span class="label">Elev Gain</span><span class="val">+` + metrics.elevGain + ` m</span></div>
+                        <div class="stat-card"><span class="label">Steps</span><span class="val">` + metrics.steps + `</span></div>
+                        <div class="stat-card"><span class="label">Cost</span><span class="val">` + metrics.movementCost + `</span></div>
+                        <div class="stat-card"><span class="label">Planning Time</span><span class="val">` + (metrics.planningTimeMs / 1000).toFixed(3) + ` s</span></div>
+                        <div class="stat-card"><span class="label">Replans</span><span class="val">` + metrics.replanningCount + `</span></div>
+                        <div class="stat-card"><span class="label">Start</span><span class="val">[` + this.grid.start.col + `,` + this.grid.start.row + `]</span></div>
+                        <div class="stat-card"><span class="label">Destination</span><span class="val">[` + this.grid.destination.col + `,` + this.grid.destination.row + `]</span></div>
+                        <div class="stat-card"><span class="label">Obstacles</span><span class="val">` + obstacleCount + `</span></div>
+                    </div>
+                    <div class="route-history-box">
+                        <h4>Traversed Route (` + this.simulation.routeHistory.length + ` waypoints)</h4>
+                        <div class="route-string">` + routeCoords + `</div>
+                    </div>
+
+                    <!-- Final Mission Telemetry (Displayed at end of summary after destination is reached) -->
+                    <div class="mission-telemetry-summary-box" style="background: rgba(6, 182, 212, 0.07); border: 1px solid rgba(6, 182, 212, 0.35); border-radius: 10px; padding: 14px; margin-top: 6px; display: flex; flex-direction: column; gap: 10px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 8px;">
+                            <h4 style="font-size: 12.5px; font-weight: 700; color: var(--accent-cyan); display: flex; align-items: center; gap: 6px; text-transform: uppercase; letter-spacing: 0.8px; font-family: var(--font-mono); margin: 0;">
+                                <span>📡</span> Final Mission Telemetry
+                            </h4>
+                            <span style="font-size: 10.5px; padding: 3px 8px; border-radius: 4px; background: ` + (isSuccess ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)') + `; color: ` + (isSuccess ? 'var(--accent-emerald)' : 'var(--accent-red)') + `; font-weight: 700; font-family: var(--font-mono);">` + (isSuccess ? 'DESTINATION REACHED' : 'MISSION HALTED') + `</span>
+                        </div>
+
+                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; font-size: 11.5px; font-family: var(--font-mono);">
+                            <div style="background: rgba(0,0,0,0.35); padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.06);">
+                                <div style="color: var(--text-muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;">Distance Traveled</div>
+                                <div style="font-size: 14px; font-weight: 700; color: #fff;">` + metrics.distance + ` m</div>
+                            </div>
+                            <div style="background: rgba(0,0,0,0.35); padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.06);">
+                                <div style="color: var(--text-muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;">Fuel Burned</div>
+                                <div style="font-size: 14px; font-weight: 700; color: var(--accent-emerald);">` + metrics.fuel + ` L</div>
+                            </div>
+                            <div style="background: rgba(0,0,0,0.35); padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.06);">
+                                <div style="color: var(--text-muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;">Fuel Efficiency Rate</div>
+                                <div style="font-size: 14px; font-weight: 700; color: var(--accent-cyan);">` + (metrics.fuel / Math.max(0.1, metrics.distance)).toFixed(2) + ` L/m</div>
+                            </div>
+                            <div style="background: rgba(0,0,0,0.35); padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.06);">
+                                <div style="color: var(--text-muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;">Elevation Climb</div>
+                                <div style="font-size: 14px; font-weight: 700; color: var(--accent-amber);">+` + metrics.elevGain + ` m</div>
+                            </div>
+                        </div>
+
+                        <div style="background: rgba(0,0,0,0.35); border: 1px solid var(--panel-border); border-radius: 6px; padding: 8px 10px; font-size: 11px; font-family: var(--font-mono);">
+                            <div style="display:flex; justify-content:space-between; margin-bottom: 4px;">
+                                <span style="color: var(--text-secondary);">Route Strategy:</span>
+                                <strong style="color: #fff;">` + (metrics.routeOptimization === 'shortest' ? 'Shortest (Distance-Optimal)' : 'Best (Fuel-Optimal)') + `</strong>
+                            </div>
+                            <div style="display:flex; justify-content:space-between; margin-bottom: 4px;">
+                                <span style="color: var(--text-secondary);">Terrain Topography:</span>
+                                <strong style="color: var(--accent-cyan);">` + (this.grid.slopeProfile || 'ridges').toUpperCase() + ` (` + (this.grid.slopeIntensity || 1.0) + `x Grade)</strong>
+                            </div>
+                            ` + (metrics.fuelSavingsPercent > 0 ? `
+                            <div style="display:flex; justify-content:space-between; color: var(--accent-emerald); font-weight: 700; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 5px; margin-top: 4px;">
+                                <span>Realized Savings:</span>
+                                <span>⚡ ` + metrics.fuelSavingsPercent + `% Fuel Saved vs Alternative</span>
+                            </div>` : '') + `
+                        </div>
+                    </div>
+                `;
+                this.dom.summaryModal.classList.add('open');
+            }
+        }
+
+        
+        
+        /* ==========================================================================
+           10. BACKEND & WEBSOCKET CLIENT (Non-blocking / Graceful Offline Fallback)
+           ========================================================================== */
+        class BackendClient {
+            constructor() {
+                this.baseUrl = 'http://localhost:3000';
+                this.wsUrl = 'ws://localhost:3000/ws';
+                this.isOnline = false;
+                this.px4Status = { connected: false, status: 'PX4_DISCONNECTED' };
+                this.ws = null;
+                this.lastTelemetrySend = 0;
+                this.telemetryIntervalMs = 120; // ~8 Hz throttled
+
+                this.dom = {
+                    backendBadge: document.getElementById('backend-status-badge'),
+                    backendText: document.getElementById('backend-status-text'),
+                    px4Badge: document.getElementById('px4-status-badge'),
+                    px4Text: document.getElementById('px4-status-text')
+                };
+
+                this.checkHealth();
+                this.connectWebSocket();
+
+                // Periodic health check every 4 seconds
+                setInterval(() => this.checkHealth(), 4000);
+            }
+
+            async checkHealth() {
+                try {
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 1500);
+                    const res = await fetch(`${this.baseUrl}/api/health`, {
+                        signal: controller.signal
+                    });
+                    clearTimeout(timeoutId);
+
+                    if (res.ok) {
+                        if (!this.isOnline) {
+                            this.isOnline = true;
+                            this.updateUI(true);
+                            this.fetchPX4Status();
+                        }
+                    } else {
+                        if (this.isOnline) {
+                            this.isOnline = false;
+                            this.updateUI(false);
+                        }
+                    }
+                } catch (e) {
+                    if (this.isOnline) {
+                        this.isOnline = false;
+                        this.updateUI(false);
+                    }
+                }
+            }
+
+            async fetchPX4Status() {
+                if (!this.isOnline) return;
+                try {
+                    const res = await fetch(`${this.baseUrl}/api/px4/status`);
+                    if (res.ok) {
+                        const data = await res.json();
+                        this.px4Status = data;
+                        this.updatePX4UI(data.connected);
+                    }
+                } catch (e) {
+                    this.updatePX4UI(false);
+                }
+            }
+
+            updateUI(online) {
+                if (!this.dom.backendBadge || !this.dom.backendText) return;
+                if (online) {
+                    this.dom.backendBadge.className = 'backend-badge online';
+                    this.dom.backendText.textContent = 'Online';
+                    this.dom.backendBadge.title = 'Backend Server Active on http://localhost:3000';
+                } else {
+                    this.dom.backendBadge.className = 'backend-badge offline';
+                    this.dom.backendText.textContent = 'Offline';
+                    this.dom.backendBadge.title = 'Backend Server Offline (Simulation running locally)';
+                    this.updatePX4UI(false);
+                }
+            }
+
+            updatePX4UI(connected) {
+                if (!this.dom.px4Badge || !this.dom.px4Text) return;
+                if (connected) {
+                    this.dom.px4Badge.className = 'px4-badge connected';
+                    this.dom.px4Text.textContent = 'Connected';
+                    this.dom.px4Badge.title = 'PX4 SITL Bridge Connected';
+                } else {
+                    this.dom.px4Badge.className = 'px4-badge disconnected';
+                    this.dom.px4Text.textContent = 'Disconnected';
+                    this.dom.px4Badge.title = 'PX4 SITL / ROS 2 Bridge Disconnected (Optional)';
+                }
+            }
+
+            connectWebSocket() {
+                if (typeof WebSocket === 'undefined') return;
+                try {
+                    if (this.ws) {
+                        try { this.ws.close(); } catch(e){}
+                    }
+                    this.ws = new WebSocket(this.wsUrl);
+
+                    this.ws.onopen = () => {
+                        this.isOnline = true;
+                        this.updateUI(true);
+                    };
+
+                    this.ws.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'px4_status' && data.px4) {
+                                this.updatePX4UI(data.px4.connected);
+                            }
+                        } catch(e) {}
+                    };
+
+                    this.ws.onclose = () => {
+                        setTimeout(() => {
+                            if (this.isOnline) this.connectWebSocket();
+                        }, 5000);
+                    };
+
+                    this.ws.onerror = () => {};
+                } catch(e) {}
+            }
+
+            async sendMissionStart(missionData) {
+                if (!this.isOnline) return;
+                try {
+                    await fetch(`${this.baseUrl}/api/mission/start`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(missionData)
+                    });
+                } catch(e) {}
+            }
+
+            async sendWaypoints(waypoints, algorithm = 'A*', routeOptimization = 'best') {
+                if (!this.isOnline || !waypoints || waypoints.length === 0) return;
+                try {
+                    await fetch(`${this.baseUrl}/api/waypoints`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ algorithm, routeOptimization, waypoints })
+                    });
+                } catch(e) {}
+            }
+
+            async sendReplanning(replanningCount, waypoints, reason = 'Dynamic obstacle detected') {
+                if (!this.isOnline) return;
+                try {
+                    await fetch(`${this.baseUrl}/api/waypoints/replan`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ replanningCount, reason, waypoints })
+                    });
+                } catch(e) {}
+            }
+
+            sendTelemetryThrottled(position, orientation = {}, metrics = {}) {
+                if (!this.isOnline) return;
+                const now = performance.now();
+                if (now - this.lastTelemetrySend < this.telemetryIntervalMs) return;
+                this.lastTelemetrySend = now;
+
+                fetch(`${this.baseUrl}/api/mission/telemetry`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ position, orientation, ...metrics })
+                }).catch(() => {});
+            }
+
+            async sendMissionComplete(summary) {
+                if (!this.isOnline) return;
+                try {
+                    await fetch(`${this.baseUrl}/api/mission/complete`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ metrics: summary })
+                    });
+                } catch(e) {}
+            }
+
+            async sendMissionReset() {
+                if (!this.isOnline) return;
+                try {
+                    await fetch(`${this.baseUrl}/api/mission/reset`, {
+                        method: 'POST'
+                    });
+                } catch(e) {}
+            }
+        }
+
+        /* 11. BOOTSTRAP APP */
+        class App {
+            constructor() {
+                this.container = document.getElementById('canvas-container');
+                this.clock = new THREE.Clock();
+                this.initThree();
+                this.initEntities();
+                this.bindWindowResize();
+                this.startLoop();
+            }
+
+            initThree() {
+                this.scene = new THREE.Scene();
+                this.scene.background = new THREE.Color(0x090d16);
+                this.scene.fog = new THREE.FogExp2(0x090d16, 0.009);
+
+                const aspect = window.innerWidth / window.innerHeight;
+                this.camera = new THREE.PerspectiveCamera(45, aspect, 0.1, 500);
+                this.camera.position.set(...CAMERA_VIEWS.ISOMETRIC.pos);
+
+                this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                this.renderer.shadowMap.enabled = true;
+                this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+                this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+                this.renderer.toneMappingExposure = 1.1;
+                this.container.appendChild(this.renderer.domElement);
+
+                const ControlsClass = (typeof THREE.OrbitControls === 'function') ? THREE.OrbitControls : BuiltinOrbitControls;
+                this.controls = new ControlsClass(this.camera, this.renderer.domElement);
+                this.controls.enableDamping = true;
+                this.controls.dampingFactor = 0.06;
+                this.controls.maxPolarAngle = Math.PI / 2 - 0.04;
+                this.controls.minDistance = 12;
+                this.controls.maxDistance = 140;
+                this.controls.target.set(...CAMERA_VIEWS.ISOMETRIC.target);
+
+                const ambientLight = new THREE.AmbientLight(0x64748b, 0.85);
+                this.scene.add(ambientLight);
+
+                const hemiLight = new THREE.HemisphereLight(0x38bdf8, 0x0f172a, 0.4);
+                hemiLight.position.set(0, 50, 0);
+                this.scene.add(hemiLight);
+
+                const sunLight = new THREE.DirectionalLight(0xffffff, 1.45);
+                sunLight.position.set(40, 55, 30);
+                sunLight.castShadow = true;
+                this.scene.add(sunLight);
+
+                const rimLight = new THREE.DirectionalLight(0x0ea5e9, 0.45);
+                rimLight.position.set(-35, 25, -35);
+                this.scene.add(rimLight);
+            }
+
+            initEntities() {
+                this.grid = new Grid();
+                this.terrainView = new TerrainView(this.scene, this.grid);
+                this.rover = new Rover(this.scene, this.grid);
+                this.backendClient = new BackendClient();
+                this.simulation = new Simulation(
+                    this.grid, this.terrainView, this.rover,
+                    (metrics) => this.ui.updateMetrics(metrics),
+                    (state) => {
+                        if (state === 'MOVING' || state === 'IDLE' || state === 'PLANNING') {
+                            if (this.ui) this.ui.hasShownSummaryForCurrentRun = false;
+                        }
+                    },
+                    (notif) => this.ui.showToast(notif.message, notif.type),
+                    this.backendClient
+                );
+                this.ui = new UIController(
+                    this.scene, this.camera, this.renderer, this.controls,
+                    this.grid, this.terrainView, this.rover, this.simulation
+                );
+                                this.simulation.planPath(false);
+            }
+
+            bindWindowResize() {
+                window.addEventListener('resize', () => {
+                    const width = window.innerWidth, height = window.innerHeight;
+                    this.camera.aspect = width / height;
+                    this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(width, height);
+                    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                });
+            }
+
+            startLoop() {
+                const loop = () => {
+                    requestAnimationFrame(loop);
+                    const deltaTime = Math.min(this.clock.getDelta(), 0.1);
+                    this.simulation.update(deltaTime);
+                    this.ui.updateCameraTransition();
+                    this.controls.update();
+                    this.renderer.render(this.scene, this.camera);
+                };
+                loop();
+            }
+        }
+
+        function checkThreeAndBoot() {
+            if (typeof THREE !== 'undefined') {
+                new App();
+            } else {
+                console.warn('Waiting for THREE to load...');
+                let attempts = 0;
+                const timer = setInterval(() => {
+                    attempts++;
+                    if (typeof THREE !== 'undefined') {
+                        clearInterval(timer);
+                        new App();
+                    } else if (attempts > 30) {
+                        clearInterval(timer);
+                        const overlay = document.getElementById('diagnostics-overlay');
+                        if (overlay) {
+                            overlay.style.display = 'block';
+                            overlay.innerHTML = '<strong>Three.js 3D Engine failed to load:</strong> Please ensure your browser has internet access or allows loading from cdnjs.cloudflare.com.';
+                        }
+                    }
+                }, 100);
+            }
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', checkThreeAndBoot);
+        } else {
+            checkThreeAndBoot();
+        }
+    })();

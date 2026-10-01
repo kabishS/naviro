@@ -1212,3 +1212,146 @@ body, html {
         width: 290px;
     }
 }
+
+
+/* ==========================================================================
+   Comprehensive Responsive Media Queries for Mobile, Tablet & Various Screens
+   ========================================================================== */
+
+/* Tablets & Small Laptops (max-width: 992px) */
+@media (max-width: 992px) {
+    .top-header {
+        top: 10px;
+        left: 12px;
+        right: 12px;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .brand-section {
+        padding: 6px 12px;
+    }
+    .app-title {
+        font-size: 13px;
+    }
+    .app-subtitle {
+        font-size: 9.5px;
+    }
+    .camera-bar {
+        overflow-x: auto;
+        max-width: 100%;
+        -webkit-overflow-scrolling: touch;
+    }
+    .cam-btn {
+        padding: 5px 8px;
+        font-size: 11px;
+    }
+    .control-panel {
+        top: 64px;
+        left: 12px;
+        width: 270px;
+        max-height: calc(100vh - 120px);
+    }
+    .metrics-panel {
+        bottom: 75px;
+        right: 12px;
+        width: 240px;
+        padding: 10px 12px;
+    }
+}
+
+/* Tablets Portrait & Large Mobiles (max-width: 768px) */
+@media (max-width: 768px) {
+    .top-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+    }
+    .header-actions {
+        width: 100%;
+        justify-content: space-between;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    .control-panel {
+        top: 100px;
+        left: 12px;
+        width: calc(100vw - 24px);
+        max-width: 320px;
+        max-height: calc(52vh);
+    }
+    .metrics-panel {
+        bottom: 70px;
+        right: 12px;
+        left: 12px;
+        width: auto;
+        max-width: calc(100vw - 24px);
+    }
+    .bottom-controls-dock {
+        bottom: 10px;
+        width: calc(100vw - 24px);
+        justify-content: center;
+        padding: 6px 8px;
+    }
+    .dock-buttons {
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+    .btn-dock {
+        padding: 6px 10px;
+        font-size: 11px;
+    }
+    .tool-grid {
+        grid-template-columns: repeat(3, 1fr);
+    }
+    .action-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+/* Small Mobile Screens (max-width: 480px) */
+@media (max-width: 480px) {
+    .brand-section {
+        padding: 5px 10px;
+    }
+    .app-title {
+        font-size: 12px;
+    }
+    .app-subtitle {
+        display: none;
+    }
+    .cam-btn {
+        padding: 4px 6px;
+        font-size: 10px;
+    }
+    .status-badge {
+        padding: 4px 8px;
+        font-size: 9.5px;
+    }
+    .control-panel {
+        top: 90px;
+        left: 8px;
+        right: 8px;
+        width: auto;
+        max-height: 46vh;
+        padding: 10px;
+    }
+    .metrics-panel {
+        bottom: 65px;
+        left: 8px;
+        right: 8px;
+        width: auto;
+        padding: 8px 10px;
+    }
+    .bottom-controls-dock {
+        bottom: 8px;
+        left: 8px;
+        right: 8px;
+        transform: none;
+        width: auto;
+        border-radius: 12px;
+    }
+    .btn-dock {
+        padding: 5px 8px;
+        font-size: 10.5px;
+    }
+}

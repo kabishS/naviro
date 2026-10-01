@@ -6,6 +6,7 @@
  */
 
 const http = require('http');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
@@ -22,7 +23,6 @@ const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 // 1. CORS Configuration (supports flexible local development ports e.g. 8080, 5173, etc.)
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps, curl, or same-origin)
     if (!origin || FRONTEND_URL === '*' || origin.includes('localhost') || origin.includes('127.0.0.1')) {
       return callback(null, true);
     }
@@ -37,17 +37,8 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// 3. Lightweight Request Logger
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on('finish', () => {
-    const duration = Date.now() - start;
-    if (req.path !== '/api/health') {
-      // console.log(`[HTTP] ${req.method} ${req.path} -> ${res.statusCode} (${duration}ms)`);
-    }
-  });
-  next();
-});
+// 3. Serve Frontend Static Files (index.html, js/, css/)
+app.use(express.static(path.join(__dirname, '..')));
 
 // 4. API Routes
 app.use('/api/mission', missionRoutes);
